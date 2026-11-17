@@ -33,7 +33,7 @@
 - 监听 `TCP_PORTS` / `UDP_PORTS` 清单内的端口，任何**非白名单**来源的入站新连接都会被加入 nft 黑名单（时长 `BAN_TIME`，默认 86400 秒 = 24 小时）。IPv6 来源默认**逐地址**封禁，与 IPv4 语义对称；想让同一前缀共用一个槽位就调 `V6_AGG_PREFIXLEN`。
 - 同时记录 ICMP echo-request（ping）探测：默认只写数据库，不加黑名单、不丢包——用于审计"谁在探测 NAS 是否在线"；把 `ENABLE_ICMP_BAN` 设为 `True` 可改为同样拉黑 24 小时。
 - 规则挂在 `prerouting` 链、优先级 `-110`，即位于 Docker DNAT（`-100`）之前，`saddr` / `dport` 都是原始值。
-- 封禁时查询 IP 归属地（离线库优先，缺失时在线补充），记录写入 SQLite，便于筛选统计。
+- 封禁时查询 IP 归属地（离线库优先；任一字段缺失时改用在线结果），记录写入 SQLite，便于筛选统计。
 
 **能保护**
 
@@ -166,7 +166,7 @@ venv/bin/pip install -r requirements.txt
 
 > ⚠️ 不要先建 venv 再 `mv`——activate 里的路径会写死旧位置。请直接在 `/root/port_scan_guard` 下建。
 
-`requests` 仅用于离线库缺失国家或 ISP 时的在线补充；未安装时可正常运行（只是没有在线补充）。在线查询失败或限流后熔断 5 分钟，期间完全使用离线结果；`ONLINE_API` 置空可彻底关闭在线查询。
+`requests` 仅用于离线库任一字段缺失时的在线归属地查询；未安装时可正常运行（只是没有在线补充）。在线查询成功时该条记录全部采用在线值（不与离线结果混用）；失败或限流后熔断 5 分钟，期间完全使用离线结果；`ONLINE_API` 置空可彻底关闭在线查询。
 
 ---
 
@@ -534,7 +534,7 @@ sudo journalctl -u port-scan-guard -f
 - ICMP 探测（`ENABLE_ICMP_BAN=True`）：`[时间] ban IP:ICMPv6 (国家/省/市/ISP) [来源]`，与端口扫描同一套 `ban` / `dry_run` / `ban_failed` 输出
 
 `result` 取值：`dry_run`（只记录）、`ban`（已封禁）、`ban_failed`（封禁失败）、`icmp_probe`（ICMP 仅记录）。`event_type` 为 `icmp` 时，`result` 可能是 `icmp_probe`（仅记录模式）或 `ban` / `dry_run`（封禁模式）。
-`来源` 取值：`offline`、`online`、`offline+online`、`unknown`。
+`来源` 取值：`offline`、`online`、`unknown`。
 
 > 内核原始日志（nft log）在 `journalctl -k`，前缀为 `HOST_SCAN:` / `HOST_ICMP:`；服务日志则是脚本处理后的上面这种格式。
 

@@ -400,7 +400,7 @@ DB_PATH        = "/root/port_scan_guard/scan.db"
 XDB_V4         = "/root/port_scan_guard/ip2region_v4.xdb"
 XDB_V6         = "/root/port_scan_guard/ip2region_v6.xdb"
 
-# 在线归属地查询（离线库缺失国家或 ISP 时触发；已有国家+ISP 时不查询）
+# 在线归属地查询（离线库任一字段缺失时触发；在线成功则整条采用在线值）
 # ★ ip-api.com 免费版只提供明文 HTTP（无 HTTPS），且会暴露查询的 IP；
 #   介意的话把 ONLINE_API 置空字符串（""）即可完全关闭在线查询。
 ONLINE_API     = ("http://ip-api.com/json/{ip}"
@@ -1474,6 +1474,7 @@ def _cache_put(ip: str, info: dict):
 
 
 def get_ip_info(ip: str) -> dict:
+    """离线库优先；任一字段缺失时查询在线，并整条采用在线结果。"""
     cached = _cache_get(ip)
     if cached is not None:
         return cached
@@ -1490,21 +1491,16 @@ def get_ip_info(ip: str) -> dict:
 
     need_online = (
         not info
-        or info.get("country") in (None, "", UNKNOWN)
-        or info.get("isp")     in (None, "", UNKNOWN)
+        or any(info.get(k) in (None, "", UNKNOWN)
+               for k in ("country", "province", "city", "isp"))
     )
 
     if need_online:
         online = _query_online(ip)
         if online:
-            if not info:
-                info = online
-                source = "online"
-            else:
-                for k in ("country", "province", "city", "isp"):
-                    if not info.get(k) or info.get(k) == UNKNOWN:
-                        info[k] = online.get(k, UNKNOWN)
-                source = "offline+online"
+            # 不混用两个数据源：一旦查询成功，整条记录都取在线值
+            info = online
+            source = "online"
 
     for k in ("country", "province", "city", "isp"):
         info.setdefault(k, UNKNOWN)
