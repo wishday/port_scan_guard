@@ -245,6 +245,10 @@ NFT_PREROUTING_PRIORITY = -110
 #   因此本脚本把 log 和 drop 拆成两条规则：
 #     - log 规则受 limit 限速（超速包不写日志）
 #     - drop 规则无条件执行（不受 limit 影响，保证安全）
+# ★ 代价（属于取舍，不是 bug）：limit 是**全局限速**而非 per-IP，单个 IP
+#   打满 5/s 就会让其他 IP 的扫描不写日志 → 不进黑名单（但这些包仍被 drop，
+#   只是没有 24h 的持久封禁）。要高强度对抗就把 rate 调大（如 "50/sec"），
+#   代价是内核日志量同比例上升。
 # 关闭后日志量等于命中次数，仅在调试或低流量环境使用
 USE_HASHLIMIT    = True
 HASHLIMIT_RATE   = "5/sec"
@@ -257,6 +261,20 @@ HASHLIMIT_BURST  = 10
 #           不依赖 conntrack；日志量高，仅在 conntrack 不可用时使用
 # ★ 无论本开关如何，drop 规则都不加 ct state，保证已建立流的后续包也丢弃
 UDP_NEW_CONN_ONLY = True
+
+# 是否检测"非 SYN"的 TCP 扫描（FIN / XMAS / NULL 扫描）
+#   默认规则只匹配 纯 SYN（tcp flags & (syn|ack) == syn），
+#   nmap -sF / -sX / -sN 这类扫描因此完全隐形。开启后额外匹配：
+#     - tcp flags fin + ct state invalid,untracked            → FIN / XMAS
+#     - tcp flags & (fin|syn|rst|psh|ack|urg) == 0 + 同上状态  → NULL
+#   ★ ct state 不能省：扫描包是"无 SYN 的首包"，conntrack 判 invalid；
+#     正常关闭连接的 FIN+ACK 是 established。省掉会误封回程 FIN（见
+#     _build_nft_config 里的实测说明）。
+#   ★ 本项依赖 nf_conntrack（Docker 环境默认可用）；conntrack 不可用时
+#     配置加载会失败并回滚，此时请改为 False。
+#   ★ ACK 扫描（nmap -sA）不在覆盖范围：ACK 包与正常流量无法用标志位区分，
+#     只能靠 ct state，而正常 ACK 大量存在。
+ENABLE_FLAG_SCAN = True
 
 CMD_TIMEOUT = 10                # 单条 nft 命令的超时（秒）
 
@@ -275,11 +293,15 @@ XDB_V4         = "/root/port_scan_guard/ip2region_v4.xdb"
 XDB_V6         = "/root/port_scan_guard/ip2region_v6.xdb"
 
 # 在线归属地查询（仅当离线库未命中时使用）
+# ★ ip-api.com 免费版只提供明文 HTTP（无 HTTPS），且会暴露查询的 IP；
+#   介意的话把 ONLINE_API 置空字符串（""）即可完全关闭在线查询。
 ONLINE_API     = ("http://ip-api.com/json/{ip}"
                   "?lang=zh-CN&fields=status,country,regionName,city,isp")
 # ★ 用 (connect, read) 元组，避免单值 5 被解释为"各 5 秒"最坏 10 秒；
 #   最坏总耗时 5 秒，远离 STOP_GRACE=8 的强制杀死边界
 ONLINE_TIMEOUT = (2, 3)
+# 在线查询失败后的熔断时长（秒）：期间不再发起请求，避免封禁路径被拖慢
+ONLINE_FAIL_BACKOFF = 300
 UNKNOWN        = "未知"
 
 # ---- 数据库保留策略 ----
@@ -321,6 +343,7 @@ _extra_v4    = []
 _extra_v6    = []
 
 _ip_info_cache = {}
+_online_fail_until = 0.0        # 在线查询熔断截止时间（time.time 基准）
 
 _firewall_setup_done = False
 
@@ -374,11 +397,36 @@ def _nft_table_exists():
     return r.returncode == 0
 
 
+def _expires_to_seconds(exp):
+    """把 nft JSON 的 expires 统一转成"剩余秒数"，无法判断时返回 None。
+
+    ★ nft >= 0.9 的 JSON 输出单位是**秒**（实测 1.0.9：120s 元素过 3 秒后
+      为 116，文本形式同时显示 expires 1m56s952ms），极老版本才是毫秒。
+      这里以"剩余时间不可能超过 max(BAN_TIME*2, 7 天)"作为判据区分两者。
+    """
+    if exp is None:
+        return None
+    try:
+        v = float(exp)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return 0
+    # 秒值不可能超过 max(BAN_TIME*2, 7 天)；超过即视为毫秒
+    if v > max(BAN_TIME * 2, 604800):
+        v /= 1000.0
+    return int(v)
+
+
 def _extract_set_elements(set_name):
     """从 nft set 中提取现有元素（用于重建表时恢复封禁）。
 
-    返回 [(ip, expires), ...]。nft JSON 输出的 expires 单位是毫秒，
-    调用方需自行 /1000 转为秒。
+    返回 [(ip, 剩余秒数 or None), ...]，秒数已由 _expires_to_seconds 归一。
+
+    ★ nft -j 的元素是**两层嵌套**：
+        "elem": [ { "elem": { "val": "1.2.3.4", "expires": 86392 } } ]
+      直接读 elem["val"] 永远是 None，会导致重启后封禁全部丢失。
+      无 timeout 的普通元素则可能直接是字符串或 {"val": ...}，两种都要兼容。
     """
     r = _nft(["-j", "list", "set", "inet", NFT_TABLE, set_name])
     if r.returncode != 0:
@@ -396,11 +444,16 @@ def _extract_set_elements(set_name):
         for elem in s.get("elem", []):
             if isinstance(elem, str):
                 elements.append((elem, None))
-            elif isinstance(elem, dict):
-                val = elem.get("val")
-                exp = elem.get("expires")
-                if isinstance(val, str):
-                    elements.append((val, exp))
+                continue
+            if not isinstance(elem, dict):
+                continue
+            # 兼容 {"elem": {"val":..,"expires":..}} 与 {"val":..,"expires":..}
+            node = elem
+            if "val" not in node and isinstance(node.get("elem"), dict):
+                node = node["elem"]
+            val = node.get("val")
+            if isinstance(val, str):
+                elements.append((val, _expires_to_seconds(node.get("expires"))))
     return elements
 
 
@@ -533,6 +586,31 @@ def _build_nft_config():
         if final_verdict:
             L.append(f"        {tcp_match} {final_verdict}")
 
+    # 非 SYN 扫描（nmap -sF/-sX/-sN）：只认纯 SYN 会让这类扫描完全隐形
+    #   - FIN / XMAS：带 fin 标志
+    #   - NULL：六个标志位全为 0，正常流量不会出现
+    #   ★ 必须加 ct state invalid,untracked，原因实测如下：
+    #     FIN 扫描是"无 SYN 的首包"，conntrack 判 invalid（校验和正确的
+    #     nmap -sF 包实测就是 invalid）；而正常关闭连接的 FIN+ACK 处于
+    #     established。不限定状态会误封"回程 FIN+ACK"——本地临时端口若
+    #     落在端口清单里（如 50000/50070/51413），正常服务端会被封 24h。
+    #   ★ 不能用 `ct state != established,related`：nft 对 ct state 是位图
+    #     比较，实测该写法连 established 的包也会命中，等于没排除。
+    #   ★ 限定 invalid 不构成新攻击面：伪造源 IP 发一个 SYN 到清单端口
+    #     本来就能让第三方被封，FIN+invalid 不比它更强。
+    if tcp_ports and ENABLE_FLAG_SCAN:
+        flag_matches = (
+            f"tcp dport @{NFT_TABLE}_tcp tcp flags fin "
+            f"ct state invalid,untracked",
+            f"tcp dport @{NFT_TABLE}_tcp "
+            f"tcp flags & (fin|syn|rst|psh|ack|urg) == 0 "
+            f"ct state invalid,untracked",
+        )
+        for m in flag_matches:
+            L.append(f"        {m} {log_stmt}")
+            if final_verdict:
+                L.append(f"        {m} {final_verdict}")
+
     # UDP：无 flags 可过滤，用 ct state new 只对"新建流"打日志
     #   - 单 IP 高频打同一端口 → 只有首包 log，后续 established 不 log
     #   - 端口扫描 → 每个新流仍会 log，由 HASHLIMIT 兜底限速
@@ -585,7 +663,11 @@ def setup_firewall():
     r = _nft_load(config)
     if r.returncode != 0:
         # ★ 回滚：重新加载备份，保证系统不裸奔
-        print(f"[!] 加载 nftables 配置失败:\n{r.stderr}", flush=True)
+        # ★ nft 的报错只给 /dev/stdin:38:69 这类行号，看不出是哪张表、
+        #   哪套前缀；容器与宿主各部署一份时容易认错实例，这里显式带上
+        print(f"[!] 加载 nftables 配置失败（表 inet {NFT_TABLE}，"
+              f"前缀 {PORT_SCAN_PREFIX} / {ICMP_PROBE_PREFIX}）:"
+              f"\n{r.stderr}", flush=True)
         if backup:
             print("[!] 正在回滚到旧配置，避免端口裸奔...", flush=True)
             rr = _nft_load(backup)
@@ -595,35 +677,46 @@ def setup_firewall():
                 print(f"[!] 回滚也失败！系统当前无防护:\n{rr.stderr}",
                       flush=True)
                 print("[!] 请立即手动检查: "
-                      "nft list table inet port_scan_guard", flush=True)
+                      f"nft list table inet {NFT_TABLE}", flush=True)
         else:
             print("[!] 无可回滚的旧配置，系统当前无防护", flush=True)
+        if "conntrack" in (r.stderr or "").lower():
+            print("[!] 以上错误与 conntrack 相关：内核缺 nf_conntrack 时，"
+                  "请把 UDP_NEW_CONN_ONLY 与 ENABLE_FLAG_SCAN 设为 False",
+                  flush=True)
         sys.exit("[!] 退出（请修复配置后重启）")
 
     # 恢复封禁记录：按剩余时间恢复，避免重启后封禁被无限续期。
-    # nft JSON 输出的 expires 单位是毫秒 → 除以 1000 转秒。
-    def _restore(setname, items):
-        for ip, exp in items:
-            if exp is None:
-                t = BAN_TIME
-            else:
-                try:
-                    t = int(exp) // 1000          # 毫秒 → 秒
-                except (TypeError, ValueError):
+    # ★ 剩余秒数已由 _extract_set_elements() 归一化，这里直接用。
+    # ★ 拼成一个 nft -f 批量加载：上千条封禁时避免上千次 fork。
+    def _restore(pairs):
+        lines = []
+        for setname, items in pairs:
+            for ip, t in items:
+                if t is None:
                     t = BAN_TIME
-            if t <= 0:
-                continue
-            if t > BAN_TIME:
-                t = BAN_TIME
-            _nft(["add", "element", "inet", NFT_TABLE,
-                  setname, f"{{ {ip} timeout {t}s }}"])
+                if t <= 0:
+                    continue
+                if t > BAN_TIME:
+                    t = BAN_TIME
+                lines.append(
+                    f"add element inet {NFT_TABLE} {setname} "
+                    f"{{ {ip} timeout {int(t)}s }}")
+        if not lines:
+            return 0
+        r = _nft_load("\n".join(lines) + "\n")
+        if r.returncode != 0:
+            print(f"[!] 恢复封禁记录失败（表 inet {NFT_TABLE}）: "
+                  f"{r.stderr.strip()}", flush=True)
+            return 0
+        return len(lines)
 
-    _restore(f"{NFT_TABLE}_bl4", old_v4)
-    _restore(f"{NFT_TABLE}_bl6", old_v6)
+    restored = _restore(
+        [(f"{NFT_TABLE}_bl4", old_v4), (f"{NFT_TABLE}_bl6", old_v6)])
 
     if old_v4 or old_v6:
-        print(f"[*] 恢复封禁记录: v4={len(old_v4)} v6={len(old_v6)}",
-              flush=True)
+        print(f"[*] 恢复封禁记录: 成功 {restored} 条 "
+              f"(旧表 v4={len(old_v4)} v6={len(old_v6)})", flush=True)
 
     _firewall_setup_done = True
 
@@ -740,8 +833,14 @@ def _load_searcher(xdb_path, ip_version):
         except Exception:
             pass
 
+    # 回退：手工加载向量索引再建 searcher
+    # （部分版本没有 loadVectorIndexFromFile，用 getattr 避免 AttributeError）
+    load_vec = getattr(util, "loadVectorIndexFromFile", None)
+    if load_vec is None:
+        print(f"[!] {xdb_path} 无法通过任何已知 API 加载", flush=True)
+        return None
     try:
-        vec = util.loadVectorIndexFromFile(xdb_path)
+        vec = load_vec(xdb_path)
         for api_name in ("new_with_vector_index", "newWithVectorIndex"):
             fn = getattr(searcher, api_name, None)
             if fn is None:
@@ -767,7 +866,11 @@ def init_ip_lookup():
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
 
-    _db_conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+    try:
+        _db_conn = sqlite3.connect(DB_PATH, timeout=10,
+                                   check_same_thread=False)
+    except Exception as e:
+        sys.exit(f"[!] 打开数据库失败 {DB_PATH}: {e}")
     _db_conn.execute("PRAGMA journal_mode=WAL")
     _db_conn.execute("PRAGMA synchronous=NORMAL")
     _db_conn.execute("PRAGMA wal_autocheckpoint=10000")   # 约 40MB 才合并回主库
@@ -878,8 +981,17 @@ def _query_offline(ip: str) -> dict:
 
 
 def _query_online(ip: str) -> dict:
+    # ★ 在线查询在封禁路径上串行执行，失败时最坏阻塞 ONLINE_TIMEOUT 秒，
+    #   且每个新 IP 都会重试一次 → 批量新 IP 时封禁严重滞后、日志刷屏。
+    #   因此失败后熔断一段时间，期间直接跳过（不影响离线库命中）。
+    global _online_fail_until
+
     # 退出中不再发起网络请求，避免拖慢退出
     if _shutdown_requested:
+        return {}
+    if not ONLINE_API:
+        return {}
+    if time.time() < _online_fail_until:
         return {}
     try:
         import requests
@@ -901,7 +1013,9 @@ def _query_online(ip: str) -> dict:
             "isp":      data.get("isp")        or UNKNOWN,
         }
     except Exception as e:
-        print(f"[!] 在线查询失败 {ip}: {e}", flush=True)
+        _online_fail_until = time.time() + ONLINE_FAIL_BACKOFF
+        print(f"[!] 在线查询失败 {ip}: {e}"
+              f"（{ONLINE_FAIL_BACKOFF}s 内不再尝试在线查询）", flush=True)
         return {}
 
 
@@ -966,12 +1080,18 @@ def get_ip_info(ip: str) -> dict:
 
 # ---------------- 封禁 ----------------
 
-def _should_skip_dedup(ip: str) -> bool:
+def _should_skip_dedup(ip: str, kind: str = "scan") -> bool:
+    """同一 (事件类型, IP) 在窗口期内只处理一次。
+
+    ★ 按 kind 分开去重：端口扫描与 ICMP 探测各自独立，
+      否则同一 IP 先扫描再 ping 时，ping 记录会被扫描的去重窗口吞掉。
+    """
     now = time.time()
-    last = _recent_bans.get(ip, 0)
+    key = (kind, ip)
+    last = _recent_bans.get(key, 0)
     if now - last < BAN_DEDUP_WINDOW:
         return True
-    _recent_bans[ip] = now
+    _recent_bans[key] = now
 
     if len(_recent_bans) > 100000:
         cutoff = now - BAN_DEDUP_WINDOW
@@ -1011,7 +1131,7 @@ def ban(ip: str, port: int = None, protocol: str = None):
     setname = f"{NFT_TABLE}_bl6" if is_v6 else f"{NFT_TABLE}_bl4"
     family = "ipv6" if is_v6 else "ipv4"
 
-    skip = _should_skip_dedup(ip)
+    skip = _should_skip_dedup(ip, "scan")
 
     if DRY_RUN:
         # DRY_RUN 下也走去重，避免日志狂刷时把库写爆
@@ -1019,23 +1139,32 @@ def ban(ip: str, port: int = None, protocol: str = None):
             return
         result = "dry_run"
     else:
+        # 去重窗口内直接返回：不再 fork nft，避免日志刷屏时的进程风暴
         if skip:
-            r = _nft(["get", "element", "inet", NFT_TABLE, setname,
-                      f"{{ {ip} }}"])
-            if r.returncode == 0:
-                return
+            return
 
-        _nft(["delete", "element", "inet", NFT_TABLE, setname, f"{{ {ip} }}"])
+        # ★ 已在黑名单中：直接返回，不 delete/add、不写库。
+        #   否则持续扫描者每 10 秒（去重窗口）就会把 timeout 重置为 BAN_TIME
+        #   → 实际成为永久封禁（与"24 小时"的语义不符），
+        #     且单 IP 每天往库里写 8640 行。
+        r = _nft(["get", "element", "inet", NFT_TABLE, setname, f"{{ {ip} }}"])
+        if r.returncode == 0:
+            return
+
         r = _nft(["add", "element", "inet", NFT_TABLE, setname,
                   f"{{ {ip} timeout {BAN_TIME}s }}"])
         if r.returncode == 0:
             result = "ban"
         else:
             result = "ban_failed"
-            print(f"[!] nft 添加元素失败 {ip}: {r.stderr.strip()}",
+            print(f"[!] nft 添加元素失败 {ip}"
+                  f"（inet {NFT_TABLE} / {setname}）: {r.stderr.strip()}",
                   flush=True)
 
     info = get_ip_info(ip)
+
+    # DRY_RUN 下并没有真的封禁，duration 记 0 更符合实际语义
+    duration = 0 if result == "dry_run" else BAN_TIME
 
     try:
         _db_conn.execute(
@@ -1048,7 +1177,7 @@ def ban(ip: str, port: int = None, protocol: str = None):
                 time.time(), time.strftime("%F %T"), ip, family,
                 port, protocol,
                 info["country"], info["province"], info["city"], info["isp"],
-                info["source"], BAN_TIME, result, "port_scan",
+                info["source"], duration, result, "port_scan",
             ),
         )
         _db_conn.commit()
@@ -1080,8 +1209,8 @@ def record_icmp_probe(ip: str, protocol: str = "ICMP"):
     if addr is None:
         return
 
-    # 与端口扫描共用去重窗口
-    if _should_skip_dedup(ip):
+    # 与端口扫描分开去重（kind 不同），互不吞记录
+    if _should_skip_dedup(ip, "icmp"):
         return
 
     is_v6 = isinstance(addr, ipaddress.IPv6Address)
@@ -1140,7 +1269,28 @@ def _interruptible_sleep(seconds):
 def _dispatch_log_line(line: str):
     """处理单行日志：分流到端口扫描 / ICMP 记录。"""
     # ---- 端口扫描日志 ----
-    if PORT_SCAN_PREFIX in line:
+    # ---- ICMP 探测日志（先判断：避免 PORT_SCAN_PREFIX 是它的子串时误走扫描分支）----
+    if ENABLE_ICMP_LOG and ICMP_PROBE_PREFIX in line:
+        m = ICMP_PROBE_RE.search(line)
+        if not m:
+            return
+
+        ip = m.group("src").strip("[]")
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return
+
+        proto_str = m.group("proto")
+        protocol = proto_str if proto_str else "ICMP"
+
+        if is_whitelisted(ip):
+            return
+        record_icmp_probe(ip, protocol)
+        return
+
+    # ---- 端口扫描日志 ----
+    if PORT_SCAN_PREFIX in line and ICMP_PROBE_PREFIX not in line:
         m = PORT_SCAN_RE.search(line)
         if not m:
             return
@@ -1164,26 +1314,6 @@ def _dispatch_log_line(line: str):
         if is_whitelisted(ip):
             return
         ban(ip, port, protocol)
-        return
-
-    # ---- ICMP 探测日志 ----
-    if ENABLE_ICMP_LOG and ICMP_PROBE_PREFIX in line:
-        m = ICMP_PROBE_RE.search(line)
-        if not m:
-            return
-
-        ip = m.group("src").strip("[]")
-        try:
-            ipaddress.ip_address(ip)
-        except ValueError:
-            return
-
-        proto_str = m.group("proto")
-        protocol = proto_str if proto_str else "ICMP"
-
-        if is_whitelisted(ip):
-            return
-        record_icmp_probe(ip, protocol)
         return
 
 
@@ -1249,19 +1379,26 @@ def _consume_log_stream(proc):
 
 
 def _in_container() -> bool:
-    """判断当前是否运行在容器内。"""
+    """判断当前是否运行在容器内。
+
+    ★ cgroup v2 下容器内 /proc/1/cgroup 可能只是 "0::/"，不含运行时关键字，
+      因此这里同时看 /proc/1/cgroup 与 /proc/self/cgroup，并覆盖常见运行时名。
+      仍判断不出来时返回 False（仅影响一条启动告警，不影响防护）。
+    """
     if os.path.exists("/.dockerenv"):
         return True
     if os.path.exists("/run/.containerenv"):        # Podman
         return True
-    try:
-        with open("/proc/1/cgroup", "r") as f:
-            content = f.read()
-        if any(x in content for x in
-               ("docker", "kubepods", "containerd", "lxc")):
+    markers = ("docker", "kubepods", "containerd", "lxc",
+               "libpod", "crio", "garden", "podman")
+    for path in ("/proc/1/cgroup", "/proc/self/cgroup"):
+        try:
+            with open(path, "r") as f:
+                content = f.read()
+        except Exception:
+            continue
+        if any(x in content for x in markers):
             return True
-    except Exception:
-        pass
     return False
 
 
@@ -1319,6 +1456,10 @@ def main():
 
     print(f"[*] 已就绪：TCP {len(set(TCP_PORTS))} 个 / "
           f"UDP {len(set(UDP_PORTS))} 个端口", flush=True)
+    # ★ 表名与日志前缀全部取自配置区常量，容器部署改过之后
+    #   启动日志即可自证改动已生效（容器与宿主同时部署时必须不同）
+    print(f"[*] nft 表：inet {NFT_TABLE}；日志前缀："
+          f"{PORT_SCAN_PREFIX} / {ICMP_PROBE_PREFIX}", flush=True)
     print(f"[*] 链：PREROUTING（优先级 {NFT_PREROUTING_PRIORITY}，"
           f"在 Docker DNAT 之前）", flush=True)
     print(f"[*] 策略：内网 IPv4/IPv6 放行，"

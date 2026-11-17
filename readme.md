@@ -38,13 +38,15 @@
 **能保护**
 
 - 所有入站方向的新连接，包括宿主机自身端口。
-- macvlan 容器（若容器与主机防护端口不同，需在容器内**独立部署一份**，并使用不同日志前缀，否则会互相误封）。
+- 常见 TCP 扫描手法：**SYN 扫描**（`nmap -sS`）、**FIN / XMAS 扫描**（`-sF` / `-sX`）、**NULL 扫描**（`-sN`）。后两者由 `ENABLE_FLAG_SCAN` 控制，默认开启，且只匹配 `ct state invalid,untracked`，不会误伤正常关闭连接。
+- Docker bridge 模式发布到宿主机的服务：按**发布端口**识别（`-p 8080:80` 只认 8080），容器内部端口不可见；发布端口本身是你在用的端口，通常不该放进清单。
+- macvlan 容器（需在容器内独立部署一份脚本并使用不同前缀，否则会互相误封）。
 
 **保护不了**
 
 - 出站流量、已建立连接的后续包。
-- Docker bridge 模式 `-p` 映射到容器的端口（流量在容器 netns，宿主机 PREROUTING 之后才 DNAT）。
-- 容器主动访问宿主机的流量（走 INPUT，不走 PREROUTING）。
+- **ACK 扫描**（`nmap -sA`）：ACK 包与正常流量的标志位无法区分，只能靠 `ct state` 判定；而单独加规则会命中大量畸形 ACK 包（可被伪造源 IP 利用来误封第三方）。另外本表已对清单内端口的 TCP 新连接一律 drop，ACK 扫描收不到 RST，本来也拿不到端口状态。
+- 内网横向流量（含容器←→宿主）：源地址落在私网白名单（`172.16.0.0/12` 含默认 bridge 的 `172.17.0.0/16`），规则在端口匹配前就 `return`，不记录、不封禁。
 
 **关键理解**
 
@@ -67,7 +69,7 @@
 nft --version
 ```
 
-要求 ≥ 1.0.9。未安装：
+建议 ≥ 1.0.6（1.0.9 已实测）。未安装：
 
 ```bash
 sudo apt update && sudo apt install -y nftables
@@ -79,7 +81,9 @@ sudo apt update && sudo apt install -y nftables
 sudo nft add table inet test_log
 sudo nft add chain inet test_log c '{ type filter hook input priority filter; }'
 sudo nft add rule inet test_log c tcp dport 12345 log prefix "TEST_LOG: "
-sudo nft delete table inet test_log
+
+# 关键：log 规则只在有包命中时才触发，必须主动发一个包
+nc -zv 127.0.0.1 12345 || true
 ```
 
 另一终端：
@@ -88,7 +92,13 @@ sudo nft delete table inet test_log
 sudo journalctl -k --since "10 seconds ago" | grep TEST_LOG
 ```
 
-有输出 → OK。无输出：
+有输出 → OK。检查完清理测试表：
+
+```bash
+sudo nft delete table inet test_log
+```
+
+无输出：
 
 ```bash
 sudo apt install -y kmod
@@ -135,7 +145,7 @@ Armbian 默认 `/var/log` 挂 zram，`/var/log/kern.log` 可能不存在——�
 
 ```bash
 cd /root
-git clone git@github.com:wishday/port_scan_guard.git port_scan_guard
+git clone https://github.com/wishday/port_scan_guard.git port_scan_guard
 chmod 700 /root/port_scan_guard
 cd /root/port_scan_guard
 ```
@@ -233,7 +243,7 @@ EXTRA_WHITELIST = [
 
 **`BAN_DEDUP_WINDOW`**
 
-默认 10 秒。同一 IP 在窗口期内只处理一次，避免日志刷屏时反复写库 / 调 nft。库增长太快可调大（如 300）。
+默认 10 秒。同一 IP 的**同类事件**（端口扫描 / ICMP 各自独立）在窗口期内只处理一次，避免日志刷屏时反复写库 / 调 nft。库增长太快可调大（如 300）。
 
 **`DB_RETENTION_DAYS`**
 
@@ -243,9 +253,15 @@ EXTRA_WHITELIST = [
 
 默认 `True`：记录非白名单的 ping 探测（只记录不封禁）。想关闭改为 `False`。
 
+**`ENABLE_FLAG_SCAN`**
+
+默认 `True`：除纯 SYN 扫描外，额外检测 **FIN / XMAS 扫描**（`tcp flags fin`）与**NULL 扫描**（六个标志位全为 0）。两条规则都要求 `ct state invalid,untracked`，因此正常连接关闭时的 FIN 不会被误判；依赖 `nf_conntrack`。设为 `False` 则只保留 SYN 规则。ACK 扫描（`-sA`）不在覆盖范围内，原因见[第一节](#一功能与边界)。
+
 **`NFT_TABLE` / 日志前缀（容器场景重点）**
 
 默认表名 `port_scan_guard_host`，日志前缀 `HOST_SCAN:`（端口扫描）与 `HOST_ICMP:`（ICMP）。容器与宿主机必须使用**不同**前缀，否则会同时封禁——详见[第十五节](#十五容器--macvlan-部署)。
+
+改完不必翻代码核对：启动时的 `[*] nft 表：inet ...；日志前缀：... / ...` 一行会打印**当前生效**的表名与两个前缀，加载失败与恢复失败的告警里也会带上它们。nft 自身的报错只给 `/dev/stdin:38:69` 这类行号，不带表名，靠这行才能确认失败的是哪一个实例。
 
 ### 6.3 语法检查
 
@@ -267,6 +283,7 @@ sudo /root/port_scan_guard/venv/bin/python3 \
 
 ```
 [*] 已就绪：TCP 113 个 / UDP 5 个端口
+[*] nft 表：inet port_scan_guard_host；日志前缀：HOST_SCAN: / HOST_ICMP:
 [*] 链：PREROUTING（优先级 -110，在 Docker DNAT 之前）
 [*] 策略：内网 IPv4/IPv6 放行，命中端口即封 86400s
 [*] ICMP：只记录非白名单 echo-request，不封禁、不丢包
@@ -288,6 +305,7 @@ sudo /root/port_scan_guard/venv/bin/python3 \
 
 - `[!] 离线库不存在` / `[!] IPv4 离线库未加载` → 检查 xdb 路径/权限；不影响封禁功能。
 - `[!] 日志流异常` / `[!] 日志流已中断` → 脚本会在 5 秒后自动重连。
+- `日志限速: 5/sec` 是**全局限速**（不是 per-IP）：单个 IP 打满就会让其他来源的扫描不写日志、不进黑名单（但这些包照样被 drop）。需要更强的对抗能力就把 `HASHLIMIT_RATE` 调大，代价是内核日志量同比例上升。
 
 按 Ctrl+C 退出。
 
@@ -429,17 +447,29 @@ sudo nft list chain inet port_scan_guard_host prerouting
 `DRY_RUN=False` 时应看到：黑名单规则末尾有 `drop`，且 TCP/UDP 各多出一条**独立的** drop 规则（无 log）：
 
 ```
-    ip  saddr @port_scan_guard_host_bl4 counter drop
-    ip6 saddr @port_scan_guard_host_bl6 counter drop
+    ip  saddr @port_scan_guard_host_bl4 counter packets 0 bytes 0 drop
+    ip6 saddr @port_scan_guard_host_bl6 counter packets 0 bytes 0 drop
     ip  saddr @port_scan_guard_host_wl4 return
     ip6 saddr @port_scan_guard_host_wl6 return
     icmp type echo-request limit rate 5/second burst 10 packets log prefix "HOST_ICMP: " level info
     icmpv6 type echo-request limit rate 5/second burst 10 packets log prefix "HOST_ICMP: " level info
-    tcp dport @port_scan_guard_host_tcp tcp flags & (syn|ack) == syn limit rate 5/second burst 10 packets log prefix "HOST_SCAN: " level warn
-    tcp dport @port_scan_guard_host_tcp tcp flags & (syn|ack) == syn drop
+    tcp dport @port_scan_guard_host_tcp tcp flags syn / syn,ack limit rate 5/second burst 10 packets log prefix "HOST_SCAN: " level warn
+    tcp dport @port_scan_guard_host_tcp tcp flags syn / syn,ack drop
+    tcp dport @port_scan_guard_host_tcp tcp flags fin ct state invalid,untracked limit rate 5/second burst 10 packets log prefix "HOST_SCAN: " level warn
+    tcp dport @port_scan_guard_host_tcp tcp flags fin ct state invalid,untracked drop
+    tcp dport @port_scan_guard_host_tcp tcp flags ! fin,syn,rst,psh,ack,urg ct state invalid,untracked limit rate 5/second burst 10 packets log prefix "HOST_SCAN: " level warn
+    tcp dport @port_scan_guard_host_tcp tcp flags ! fin,syn,rst,psh,ack,urg ct state invalid,untracked drop
     udp dport @port_scan_guard_host_udp ct state new limit rate 5/second burst 10 packets log prefix "HOST_SCAN: " level warn
     udp dport @port_scan_guard_host_udp drop
 ```
+
+> 显示格式说明（nft 1.0.x 的渲染习惯，别误以为规则写错了）：
+> - 链头实际显示为 `type filter hook prerouting priority dstnat - 10;`，`dstnat - 10` 就是 `-110`。
+> - `counter` 会带上计数，显示为 `counter packets N bytes N`。
+> - 配置文件里写的 `tcp flags & (syn|ack) == syn`，列出时显示为 `tcp flags syn / syn,ack`（`值 / 掩码` 写法）。
+> - `tcp flags & (fin|syn|rst|psh|ack|urg) == 0`（NULL 扫描）显示为 `tcp flags ! fin,syn,rst,psh,ack,urg`。
+> - `tcp flags fin` 那两条规则来自 `ENABLE_FLAG_SCAN`（捕获 FIN / XMAS 扫描）；设为 `False` 后这两组规则不会出现。
+> - 这两条规则都带 `ct state invalid,untracked`：**扫描包的 conntrack 状态是 `invalid`，正常关闭连接的 FIN+ACK 是 `established`**。靠这个区分，正常回程 FIN（本地临时端口若落在端口清单里）才不会被误封。
 
 > 说明：log 规则与 drop 规则是**拆开的两条**。因为 nft 的 `limit` 是匹配表达式，若写成 `log ... drop` 一行，超速时 limit 不匹配会中断整条规则、连 drop 一起跳过，形成安全漏洞。
 
@@ -482,7 +512,9 @@ sudo nft delete element inet port_scan_guard_host port_scan_guard_host_bl4 '{ <I
 
 - `event_type`：`port_scan`（端口扫描）/ `icmp`（ICMP 探测）。
 - `result`：`dry_run` / `ban` / `ban_failed` / `icmp_probe`。
-- ICMP 记录的 `port` 为 `NULL`、`duration` 为 `0`。
+- `duration`：实际封禁秒数（`ban` 为 `BAN_TIME`）；`dry_run` 与 `icmp_probe` 均为 `0`。
+- ICMP 记录的 `port` 为 `NULL`。
+- 同一 IP 已在黑名单中时**不会重复写库**（既不续期也不再记录），因此单个攻击者 24 小时内最多留下一条 `ban` 记录。
 
 最近事件：
 
@@ -575,7 +607,9 @@ sqlite3 /root/port_scan_guard/scan.db ".backup /root/port_scan_guard/scan.db.bak
 
 ```bash
 cd /root/port_scan_guard
+git stash          # 本地用 sed 改过 DRY_RUN 时必须先暂存，否则 pull 冲突
 git pull
+git stash pop      # 暂存的改动会重新应用；若上游改了同一行，按提示解决冲突
 sudo systemctl restart port-scan-guard
 ```
 
@@ -595,6 +629,8 @@ sudo systemctl restart port-scan-guard
 | `protocol` 全为 NULL | 旧库升级后的老数据 | 确认当前脚本 `PORT_SCAN_RE` 里 `PROTO` 在 `DPT` 之前 |
 | `scan.db` 增长太快 | 被持续扫描 + 去重窗口小 | 调大 `BAN_DEDUP_WINDOW`，或暂时保持 `DRY_RUN=True` |
 | 服务反复退出/重启 | nft 配置错误或权限不足（`setup_firewall` 失败会退出） | `journalctl -u port-scan-guard -n 100 --no-pager` |
+| 启动时报 `conntrack` 相关错误 | 内核缺 `nf_conntrack` | 设 `UDP_NEW_CONN_ONLY=False`、`ENABLE_FLAG_SCAN=False`，或 `modprobe nf_conntrack` |
+| 重启后已封禁 IP 又通了 | 系统级 `nftables.service` 启动时 flush 了规则 | `nft list set inet port_scan_guard_host port_scan_guard_host_bl4`；日志找 `恢复封禁记录: 成功 N 条` |
 | 容器内无日志/不封禁 | 未开 `nf_log_all_netns` 或挂载内核日志 | 见[第十五节](#十五容器--macvlan-部署) |
 
 > 注意：日志源本身不可用时，脚本不会退出，而是每 5 秒自动重连；真正导致进程退出的通常是 `setup_firewall` 的 nft 配置/权限失败。
@@ -652,9 +688,18 @@ sudo sysctl -w net.netfilter.nf_log_all_netns=1
 -v /var/log/kern.log:/var/log/kern.log:ro
 ```
 
-**4. 前缀必须与宿主机区分**
+**4. 前缀与表名：容器和宿主必须区分**
 
 容器与宿主机若防护同一批端口，必须使用**不同**的 `PORT_SCAN_PREFIX` / `ICMP_PROBE_PREFIX`（例如容器用 `CTR_SCAN:` / `CTR_ICMP:`），否则两边会互相把对方流量当成扫描而同时封禁。
+
+表名要不要一起改，取决于网络模式：
+
+| 网络模式 | netns | `NFT_TABLE` 同名 | 说明 |
+| --- | --- | --- | --- |
+| macvlan / bridge | 独立 | 无害 | 各自 `nft list tables` 只看得到自己的表；建议仍改为 `port_scan_guard_ctr` 之类，排查时不会认错实例 |
+| `--network host` | 与宿主共享 | **会互相删除** | 后启动的实例在 `setup_firewall()` 里 `delete table`，直接把宿主的表连同封禁记录一起删掉，必须改名 |
+
+改完以启动时的 `[*] nft 表：inet ...；日志前缀：... / ...` 一行为准。
 
 **5. 端口清单按 netns 实际情况配置**
 
@@ -687,7 +732,7 @@ sudo apt install -y nftables
 
 # 2. 克隆仓库
 cd /root
-git clone git@github.com:wishday/port_scan_guard.git port_scan_guard
+git clone https://github.com/wishday/port_scan_guard.git port_scan_guard
 chmod 700 /root/port_scan_guard
 cd /root/port_scan_guard
 
