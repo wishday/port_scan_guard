@@ -1400,10 +1400,10 @@ def _query_offline(ip: str) -> dict:
 
 
 def _query_online(ip: str) -> dict:
-    # ★ 在线查询在封禁路径上串行执行，失败时最坏阻塞 ONLINE_TIMEOUT 秒
-    #   （DNS 解析在 requests timeout 之外，解析异常慢时会更久），
-    #   且每个新 IP 都会重试一次 → 批量新 IP 时封禁严重滞后、日志刷屏。
-    #   因此失败后熔断一段时间，期间直接跳过（不影响离线库命中）。
+    # ★ 在线查询在日志消费循环内同步执行，每次最多阻塞 ONLINE_TIMEOUT 秒
+    #   （DNS 解析在 requests timeout 之外，解析异常慢时会更久）。离线字段
+    #   缺失的 IP 较多时会明显拖慢后续日志处理；失败后额外熔断，避免连续
+    #   超时把循环彻底卡住；熔断期间完全使用离线结果。
     global _online_fail_until
 
     # 退出中不再发起网络请求，避免拖慢退出

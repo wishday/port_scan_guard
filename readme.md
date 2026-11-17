@@ -166,7 +166,7 @@ venv/bin/pip install -r requirements.txt
 
 > ⚠️ 不要先建 venv 再 `mv`——activate 里的路径会写死旧位置。请直接在 `/root/port_scan_guard` 下建。
 
-`requests` 仅用于离线库任一字段缺失时的在线归属地查询；未安装时可正常运行（只是没有在线补充）。在线查询成功时该条记录全部采用在线值（不与离线结果混用）；失败或限流后熔断 5 分钟，期间完全使用离线结果；`ONLINE_API` 置空可彻底关闭在线查询。
+`requests` 仅用于离线库任一字段缺失时的在线归属地查询；未安装时可正常运行（只是没有在线补充）。在线查询成功时该条记录全部采用在线值（不与离线结果混用）；失败或限流后熔断 5 分钟，期间完全使用离线结果；`ONLINE_API` 置空可彻底关闭在线查询。ip-api 免费接口限 45 次/分钟，突发扫描容易触发限流并进入熔断。
 
 ---
 
@@ -191,7 +191,7 @@ chmod 600 *.xdb
 - `[!] IPv4 离线库未加载，将全部走在线查询`
 - `[!] IPv6 离线库未加载`
 
-建议优先准备好本地离线库：在线查询在高并发时时延、请求数都可能无法满足。
+建议优先准备好本地离线库：在线查询在日志消费循环内同步执行，单次连接/读取最坏 5 秒（DNS 解析另计）；大量新 IP 的离线字段缺失时，会明显拖慢后续日志的处理与封禁记录写入。
 
 ---
 
@@ -534,7 +534,7 @@ sudo journalctl -u port-scan-guard -f
 - ICMP 探测（`ENABLE_ICMP_BAN=True`）：`[时间] ban IP:ICMPv6 (国家/省/市/ISP) [来源]`，与端口扫描同一套 `ban` / `dry_run` / `ban_failed` 输出
 
 `result` 取值：`dry_run`（只记录）、`ban`（已封禁）、`ban_failed`（封禁失败）、`icmp_probe`（ICMP 仅记录）。`event_type` 为 `icmp` 时，`result` 可能是 `icmp_probe`（仅记录模式）或 `ban` / `dry_run`（封禁模式）。
-`来源` 取值：`offline`、`online`、`unknown`。
+`来源` 取值：`offline`（整条来自离线库）、`online`（整条来自在线查询）、`unknown`（无可用归属地）。
 
 > 内核原始日志（nft log）在 `journalctl -k`，前缀为 `HOST_SCAN:` / `HOST_ICMP:`；服务日志则是脚本处理后的上面这种格式。
 
