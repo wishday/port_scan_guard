@@ -445,14 +445,18 @@ _searcher_v4 = None
 _searcher_v6 = None
 _db_conn     = None
 _db_lock     = threading.Lock()   # 主线程清理 / 后台写库线程共用连接
+# ip2region.Searcher 内部共用文件句柄（seek/read）与 io_count，
+# 不是线程安全的：离线查询统一串行化，防止多调用点并发复用。
+_ip_lookup_lock = threading.Lock()
 
 # 归属地记录异步写入：日志消费线程只入队，后台线程查归属地 + 写库 + 打印，
-# 避免在线查询把封禁主路径卡住。队列打满时降级为离线值同步写库。
+# 避免在线查询把封禁主路径卡住。队列打满时挤掉最旧记录，主线程绝不同步写库。
 _RECORD_QUEUE_MAX = 20000
 _record_queue = queue.Queue(maxsize=_RECORD_QUEUE_MAX)
 _record_worker = None
 _record_stop = threading.Event()
 _last_queue_warn_ts = 0.0
+_queue_dropped_total = 0         # 队列满时被挤掉/丢弃的记录累计数
 
 _recent_bans = {}
 _extra_v4    = []
@@ -664,7 +668,7 @@ def _validate_config():
                        ("LOOPBACK_NETS", LOOPBACK_NETS),
                        ("EXTRA_WHITELIST", EXTRA_WHITELIST)):
         if not isinstance(nets, (list, tuple)):
-            errs.append(f"{name} 必须是列表")
+            errs.append(f"{name} 必须是列表或元组")
             continue
         for n in nets:
             if not isinstance(n, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
@@ -763,10 +767,15 @@ def _build_nft_config():
     tcp_ports = sorted(set(TCP_PORTS))
     udp_ports = sorted(set(UDP_PORTS))
 
-    # 去重：用户可能把私网/回环段又写进 EXTRA_WHITELIST
-    wl_nets = list(dict.fromkeys(PRIVATE_NETS + LOOPBACK_NETS + EXTRA_WHITELIST))
-    wl4 = [n for n in wl_nets if n.version == 4]
-    wl6 = [n for n in wl_nets if n.version == 6]
+    # 精确重复项先去掉；按协议族折叠相邻/包含/重叠网段（例如把
+    # 172.17.0.0/16 折叠进 172.16.0.0/12），这样用户把私网网段或私网子网
+    # 再写进 EXTRA_WHITELIST 也不会产生 nft 的 "conflicting intervals"。
+    wl_nets = list(dict.fromkeys(
+        list(PRIVATE_NETS) + list(LOOPBACK_NETS) + list(EXTRA_WHITELIST)))
+    wl4 = list(ipaddress.collapse_addresses(
+        n for n in wl_nets if n.version == 4))
+    wl6 = list(ipaddress.collapse_addresses(
+        n for n in wl_nets if n.version == 6))
 
     # DRY_RUN 时 verdict 为空字符串（规则只 log / 只 counter，不加 verdict）
     # 这样不会用 accept 跳过 Docker DNAT，包继续流向下一个 chain
@@ -841,20 +850,18 @@ def _build_nft_config():
         L.append("    }")
 
     # ---- 白名单 set ----
-    if wl4:
-        elems = ", ".join(str(n) for n in wl4)
-        L.append(f"    set {NFT_TABLE}_wl4 {{")
-        L.append("        type ipv4_addr")
+    # 即使某一族为空也必须声明：链里无条件引用 @wl4/@wl6，
+    # 少声明一个 set 会让 nft 报 "No such file or directory"。
+    # 元素已在上面按族 collapse，保证互不重叠，flags interval 即可加载。
+    for _type, _suffix, _nets in (
+            ("ipv4_addr", "wl4", wl4),
+            ("ipv6_addr", "wl6", wl6)):
+        L.append(f"    set {NFT_TABLE}_{_suffix} {{")
+        L.append(f"        type {_type}")
         L.append("        flags interval")
-        L.append(f"        elements = {{ {elems} }}")
-        L.append("    }")
-
-    if wl6:
-        elems = ", ".join(str(n) for n in wl6)
-        L.append(f"    set {NFT_TABLE}_wl6 {{")
-        L.append("        type ipv6_addr")
-        L.append("        flags interval")
-        L.append(f"        elements = {{ {elems} }}")
+        if _nets:
+            elems = ", ".join(str(n) for n in _nets)
+            L.append(f"        elements = {{ {elems} }}")
         L.append("    }")
 
     # ---- PREROUTING 链（在 Docker DNAT 之前）----
@@ -914,7 +921,15 @@ def _build_nft_config():
             # glob（兜底 limit）在 update 之前，见 docstring 的 ★★ 说明
             L.append(f"        {head}{match} {glob}{quota_stmt}{tail}")
 
-    # 黑名单（跟随 DRY_RUN）
+    # 白名单：用 return，不能用 accept
+    # accept 会跳过整个 PREROUTING hook，破坏 Docker 端口映射。
+    # ★ 必须排在黑名单 drop 之前：白名单语义是"永远放行"，即使该地址
+    #   因历史原因仍在 bl4/bl6 中（例如先被封、后来才加入白名单），
+    #   重启恢复旧封禁后也应立即放行。
+    L.append(f"        ip  saddr @{NFT_TABLE}_wl4 return")
+    L.append(f"        ip6 saddr @{NFT_TABLE}_wl6 return")
+
+    # 黑名单（跟随 DRY_RUN）；放在白名单之后，白名单优先。
     # ★ IPv6 侧同样要带掩码，与 ban() 写入的归一地址保持同一坐标系。
     bl_rule = f"ip  saddr @{NFT_TABLE}_bl4 counter"
     if bl_verdict:
@@ -925,11 +940,6 @@ def _build_nft_config():
     if bl_verdict:
         bl_rule6 += f" {bl_verdict}"
     L.append(f"        {bl_rule6}")
-
-    # 白名单：用 return，不能用 accept
-    # accept 会跳过整个 PREROUTING hook，破坏 Docker 端口映射
-    L.append(f"        ip  saddr @{NFT_TABLE}_wl4 return")
-    L.append(f"        ip6 saddr @{NFT_TABLE}_wl6 return")
 
     # ICMP echo-request：不加 verdict（包继续走 policy accept）
     # 位置在白名单 return 之后 → 白名单的 ping 不会到达这里
@@ -1391,7 +1401,10 @@ def _query_offline(ip: str) -> dict:
     if searcher is None:
         return {}
     try:
-        region = searcher.search(ip)
+        # Searcher 内部文件句柄不可并发复用；离线查询统一串行化，
+        # 防止未来新增调用点后出现并发 seek/read。
+        with _ip_lookup_lock:
+            region = searcher.search(ip)
         if not region:
             return {}
         # 官方 ip2region_v4/v6.xdb 字段格式：
@@ -1613,7 +1626,7 @@ def _warn_table_lost():
 # ---------------- 归属地记录异步写入 ----------------
 
 def _offline_info(ip: str) -> dict:
-    """只查离线库并补齐字段。供记录队列打满时的同步降级使用。
+    """只查离线库并补齐字段。供退出阶段避免在线查询时使用。
 
     不碰 _ip_info_cache / 熔断状态：这些只由后台线程通过 get_ip_info() 访问，
     避免两个线程同时改动字典和缓存淘汰。
@@ -1680,26 +1693,46 @@ def _record_worker_loop():
                 return
             continue
         try:
-            _write_record(job)
+            # 退出阶段只查离线库，避免在线查询（最长数秒）拖住退出。
+            _write_record(job, allow_online=not _record_stop.is_set())
         except Exception as e:
             print(f"[!] 记录处理异常 {job.get('ip')}: {e}", flush=True)
 
 
 def _enqueue_record(job):
-    """把记录交给后台线程；队列打满时降级为离线值同步写库。"""
-    global _last_queue_warn_ts
+    """把记录交给后台线程；队列打满时挤掉最旧一条并保留最新，绝不阻塞主线程。"""
+    global _last_queue_warn_ts, _queue_dropped_total
     try:
         _record_queue.put_nowait(job)
         return
     except queue.Full:
         pass
 
+    evicted = False
+    try:
+        _record_queue.get_nowait()
+        evicted = True
+    except queue.Empty:
+        pass
+
+    enqueued = False
+    try:
+        _record_queue.put_nowait(job)
+        enqueued = True
+    except queue.Full:
+        pass
+
+    if evicted:
+        _queue_dropped_total += 1
+    if not enqueued:
+        _queue_dropped_total += 1
+
     now = time.time()
     if now - _last_queue_warn_ts >= 60:
         _last_queue_warn_ts = now
-        print(f"[!] 归属地记录队列已满（{_RECORD_QUEUE_MAX} 条），"
-              f"记录降级为离线归属地同步写库", flush=True)
-    _write_record(job, allow_online=False)
+        action = "已挤掉最旧一条并保留最新" if enqueued else "最新记录也未能入队"
+        print(f"[!] 归属地记录队列已满（{_RECORD_QUEUE_MAX} 条），{action}；"
+              f"累计丢弃 {_queue_dropped_total} 条", flush=True)
 
 
 def _start_record_worker():
@@ -1710,16 +1743,19 @@ def _start_record_worker():
     _record_worker.start()
 
 
-def _stop_record_worker():
+def _stop_record_worker() -> bool:
+    """停止写库线程。返回 True 表示线程已结束，可以安全关闭数据库连接。"""
     global _record_worker
     if _record_worker is None:
-        return
+        return True
     _record_stop.set()
     _record_worker.join(timeout=10)
     if _record_worker.is_alive():
-        print(f"[!] 退出超时：仍有 {_record_queue.qsize()} 条归属地记录未写库",
-              flush=True)
+        print(f"[!] 退出超时：仍有 {_record_queue.qsize()} 条归属地记录未写库；"
+              f"跳过关闭数据库连接，避免写线程访问已关闭的连接", flush=True)
+        return False
     _record_worker = None
+    return True
 
 
 def ban(ip: str, port: int = None, protocol: str = None,
@@ -2221,10 +2257,15 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[*] 已退出")
     finally:
-        # 先停后台写库线程，再关数据库连接
-        _stop_record_worker()
+        # 先停后台写库线程，再关数据库连接；线程未结束时不能 close，
+        # 否则它会继续向已关闭的 sqlite 连接写入。
+        worker_stopped = _stop_record_worker()
         if _db_conn is not None:
-            try:
-                _db_conn.close()
-            except Exception:
-                pass
+            if worker_stopped:
+                try:
+                    _db_conn.close()
+                except Exception:
+                    pass
+            else:
+                print("[!] 数据库连接未显式关闭：后台写库线程未结束，"
+                      "交由进程退出回收", flush=True)
