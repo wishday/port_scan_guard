@@ -1,5 +1,4 @@
 #!/root/port_scan_guard/venv/bin/python3
-# -*- coding: utf-8 -*-
 """
 port_scan_guard_nft.py
 
@@ -44,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Optional
 
 # ============================================================
 #                      1. 端口配置区
@@ -445,14 +445,18 @@ _searcher_v4 = None
 _searcher_v6 = None
 _db_conn     = None
 _db_lock     = threading.Lock()   # 主线程清理 / 后台写库线程共用连接
+# ip2region.Searcher 内部共用文件句柄（seek/read）与 io_count，
+# 不是线程安全的：离线查询统一串行化，防止多调用点并发复用。
+_ip_lookup_lock = threading.Lock()
 
 # 归属地记录异步写入：日志消费线程只入队，后台线程查归属地 + 写库 + 打印，
-# 避免在线查询把封禁主路径卡住。队列打满时降级为离线值同步写库。
+# 避免在线查询把封禁主路径卡住。队列打满时挤掉最旧记录，主线程绝不同步写库。
 _RECORD_QUEUE_MAX = 20000
 _record_queue = queue.Queue(maxsize=_RECORD_QUEUE_MAX)
 _record_worker = None
 _record_stop = threading.Event()
 _last_queue_warn_ts = 0.0
+_queue_dropped_total = 0         # 队列满时被挤掉/丢弃的记录累计数
 
 _recent_bans = {}
 _extra_v4    = []
@@ -483,7 +487,7 @@ def sh(cmd, check=False, timeout=CMD_TIMEOUT):
     except subprocess.TimeoutExpired:
         print(f"[!] 命令超时({timeout}s): {argv}", flush=True)
         return subprocess.CompletedProcess(argv, 1, "", "timeout")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - 命令边界兜底，避免单次调用拖垮主流程
         print(f"[!] 命令异常: {argv} -> {e}", flush=True)
         return subprocess.CompletedProcess(argv, 1, "", str(e))
 
@@ -498,19 +502,28 @@ def _nft_load(text):
         return subprocess.run(
             ["nft", "-f", "-"],
             input=text, capture_output=True, text=True,
-            timeout=CMD_TIMEOUT,
+            timeout=CMD_TIMEOUT, check=False,
         )
     except subprocess.TimeoutExpired:
         print("[!] nft -f 超时", flush=True)
         return subprocess.CompletedProcess(["nft"], 1, "", "timeout")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - nft 加载边界兜底，必须返回失败让调用方回滚
         print(f"[!] nft -f 异常: {e}", flush=True)
         return subprocess.CompletedProcess(["nft"], 1, "", str(e))
 
 
 def _nft_table_exists():
     r = _nft(["list", "table", "inet", NFT_TABLE])
-    return r.returncode == 0
+    if r.returncode == 0:
+        return True
+    err = (r.stderr or "").lower()
+    if ("no such file or directory" in err
+            or "does not exist" in err):
+        return False
+    # 权限不足 / nft 超时等不能当成"表不存在"，否则会继续 delete/load，
+    # 在无法确认现状时主动动防火墙是最危险的选择。
+    sys.exit(f"[!] 无法确认 nft 表 inet {NFT_TABLE} 是否存在，拒绝继续: "
+             f"{(r.stderr or '').strip() or 'unknown error'}")
 
 
 def _expires_to_seconds(exp):
@@ -546,10 +559,14 @@ def _extract_set_elements(set_name):
     """
     r = _nft(["-j", "list", "set", "inet", NFT_TABLE, set_name])
     if r.returncode != 0:
+        print(f"[!] 读取旧封禁集合 {set_name} 失败，重启后该集合的封禁"
+              f"不会恢复: {(r.stderr or '').strip()}", flush=True)
         return []
     try:
         data = json.loads(r.stdout)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        print(f"[!] 解析旧封禁集合 {set_name} 的 nft JSON 失败，"
+              f"重启后该集合的封禁不会恢复: {e}", flush=True)
         return []
 
     elements = []
@@ -652,6 +669,9 @@ def _validate_config():
 
     # ---- 端口清单 ----
     for name, ports in (("TCP_PORTS", TCP_PORTS), ("UDP_PORTS", UDP_PORTS)):
+        if not isinstance(ports, (list, tuple)):
+            errs.append(f"{name} 必须是列表或元组")
+            continue
         for p in ports:
             if not isinstance(p, int) or isinstance(p, bool) \
                     or not (1 <= p <= 65535):
@@ -664,7 +684,7 @@ def _validate_config():
                        ("LOOPBACK_NETS", LOOPBACK_NETS),
                        ("EXTRA_WHITELIST", EXTRA_WHITELIST)):
         if not isinstance(nets, (list, tuple)):
-            errs.append(f"{name} 必须是列表")
+            errs.append(f"{name} 必须是列表或元组")
             continue
         for n in nets:
             if not isinstance(n, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
@@ -745,6 +765,67 @@ def _validate_config():
               f"宿主机端口可能匹配不到（无 Docker 时无影响）",
               flush=True)
 
+    # ---- 布尔开关 ----
+    # ★ 这些开关直接决定是否丢包、是否擦表。写成字符串 "False" 也是真值，
+    #   会让 DRY_RUN 静默生效（只记录不封禁）或让 DESTROY_TABLE_ON_EXIT
+    #   在停服时意外删表，必须拒绝非 bool。
+    for name, val in (
+            ("DRY_RUN", DRY_RUN),
+            ("ENABLE_ICMP_LOG", ENABLE_ICMP_LOG),
+            ("ENABLE_ICMP_BAN", ENABLE_ICMP_BAN),
+            ("ENABLE_FLAG_SCAN", ENABLE_FLAG_SCAN),
+            ("UDP_NEW_CONN_ONLY", UDP_NEW_CONN_ONLY),
+            ("DESTROY_TABLE_ON_EXIT", DESTROY_TABLE_ON_EXIT),
+            ("DB_VACUUM_AFTER_CLEANUP", DB_VACUUM_AFTER_CLEANUP)):
+        if not isinstance(val, bool):
+            errs.append(f"{name}={val!r} 必须是 True/False"
+                        f'（字符串 "False" 也是真值，会造成开关静默反转）')
+
+    # ---- 数值参数 ----
+    for name, val, minimum in (
+            ("CMD_TIMEOUT", CMD_TIMEOUT, 1),
+            ("BAN_DEDUP_WINDOW", BAN_DEDUP_WINDOW, 0),
+            ("IP_INFO_CACHE_TTL", IP_INFO_CACHE_TTL, 0),
+            ("IP_INFO_CACHE_MAX", IP_INFO_CACHE_MAX, 1),
+            ("ONLINE_FAIL_BACKOFF", ONLINE_FAIL_BACKOFF, 0),
+            ("DB_CLEANUP_INTERVAL", DB_CLEANUP_INTERVAL, 1)):
+        if not isinstance(val, int) or isinstance(val, bool) or val < minimum:
+            errs.append(f"{name}={val!r} 必须是 >= {minimum} 的整数")
+    if not isinstance(DB_RETENTION_DAYS, int) \
+            or isinstance(DB_RETENTION_DAYS, bool):
+        errs.append(f"DB_RETENTION_DAYS={DB_RETENTION_DAYS!r} 必须是整数"
+                    f"（<= 0 表示不清理）")
+
+    # ---- 数据库 / 离线库路径 ----
+    if not isinstance(DB_PATH, str) or not DB_PATH.strip():
+        errs.append(f"DB_PATH={DB_PATH!r} 必须是非空字符串")
+    for name, val in (("XDB_V4", XDB_V4), ("XDB_V6", XDB_V6)):
+        if not isinstance(val, str):
+            errs.append(f"{name}={val!r} 必须是字符串（空字符串表示禁用）")
+
+    # ---- 在线查询 ----
+    if not isinstance(ONLINE_API, str):
+        errs.append(f"ONLINE_API={ONLINE_API!r} 必须是字符串")
+    elif ONLINE_API:
+        try:
+            ONLINE_API.format(ip="1.2.3.4")
+        except (KeyError, IndexError, ValueError) as e:
+            errs.append(f"ONLINE_API={ONLINE_API!r} 不是合法的 URL 模板，"
+                        f"必须包含且只使用 {{ip}} 占位符: {e}")
+    if isinstance(ONLINE_TIMEOUT, (int, float)) \
+            and not isinstance(ONLINE_TIMEOUT, bool):
+        if ONLINE_TIMEOUT <= 0:
+            errs.append(f"ONLINE_TIMEOUT={ONLINE_TIMEOUT!r} 必须 > 0")
+    elif isinstance(ONLINE_TIMEOUT, (list, tuple)):
+        if len(ONLINE_TIMEOUT) != 2 or any(
+                not isinstance(x, (int, float)) or isinstance(x, bool)
+                or x <= 0 for x in ONLINE_TIMEOUT):
+            errs.append(f"ONLINE_TIMEOUT={ONLINE_TIMEOUT!r} 必须是正数，"
+                        f"或 (connect, read) 两个正数")
+    else:
+        errs.append(f"ONLINE_TIMEOUT={ONLINE_TIMEOUT!r} 必须是正数，"
+                    f"或 (connect, read) 两个正数")
+
     # ---- 开关组合 ----
     # ★ ENABLE_ICMP_BAN=True + ENABLE_ICMP_LOG=False 只告警不退出：
     #   该组合不影响端口扫描封禁，硬退出会让服务起不来，比"ICMP 不封禁"更糟。
@@ -763,10 +844,15 @@ def _build_nft_config():
     tcp_ports = sorted(set(TCP_PORTS))
     udp_ports = sorted(set(UDP_PORTS))
 
-    # 去重：用户可能把私网/回环段又写进 EXTRA_WHITELIST
-    wl_nets = list(dict.fromkeys(PRIVATE_NETS + LOOPBACK_NETS + EXTRA_WHITELIST))
-    wl4 = [n for n in wl_nets if n.version == 4]
-    wl6 = [n for n in wl_nets if n.version == 6]
+    # 精确重复项先去掉；按协议族折叠相邻/包含/重叠网段（例如把
+    # 172.17.0.0/16 折叠进 172.16.0.0/12），这样用户把私网网段或私网子网
+    # 再写进 EXTRA_WHITELIST 也不会产生 nft 的 "conflicting intervals"。
+    wl_nets = list(dict.fromkeys(
+        list(PRIVATE_NETS) + list(LOOPBACK_NETS) + list(EXTRA_WHITELIST)))
+    wl4 = list(ipaddress.collapse_addresses(
+        n for n in wl_nets if n.version == 4))
+    wl6 = list(ipaddress.collapse_addresses(
+        n for n in wl_nets if n.version == 6))
 
     # DRY_RUN 时 verdict 为空字符串（规则只 log / 只 counter，不加 verdict）
     # 这样不会用 accept 跳过 Docker DNAT，包继续流向下一个 chain
@@ -841,20 +927,18 @@ def _build_nft_config():
         L.append("    }")
 
     # ---- 白名单 set ----
-    if wl4:
-        elems = ", ".join(str(n) for n in wl4)
-        L.append(f"    set {NFT_TABLE}_wl4 {{")
-        L.append("        type ipv4_addr")
+    # 即使某一族为空也必须声明：链里无条件引用 @wl4/@wl6，
+    # 少声明一个 set 会让 nft 报 "No such file or directory"。
+    # 元素已在上面按族 collapse，保证互不重叠，flags interval 即可加载。
+    for _type, _suffix, _nets in (
+            ("ipv4_addr", "wl4", wl4),
+            ("ipv6_addr", "wl6", wl6)):
+        L.append(f"    set {NFT_TABLE}_{_suffix} {{")
+        L.append(f"        type {_type}")
         L.append("        flags interval")
-        L.append(f"        elements = {{ {elems} }}")
-        L.append("    }")
-
-    if wl6:
-        elems = ", ".join(str(n) for n in wl6)
-        L.append(f"    set {NFT_TABLE}_wl6 {{")
-        L.append("        type ipv6_addr")
-        L.append("        flags interval")
-        L.append(f"        elements = {{ {elems} }}")
+        if _nets:
+            elems = ", ".join(str(n) for n in _nets)
+            L.append(f"        elements = {{ {elems} }}")
         L.append("    }")
 
     # ---- PREROUTING 链（在 Docker DNAT 之前）----
@@ -914,7 +998,15 @@ def _build_nft_config():
             # glob（兜底 limit）在 update 之前，见 docstring 的 ★★ 说明
             L.append(f"        {head}{match} {glob}{quota_stmt}{tail}")
 
-    # 黑名单（跟随 DRY_RUN）
+    # 白名单：用 return，不能用 accept
+    # accept 会跳过整个 PREROUTING hook，破坏 Docker 端口映射。
+    # ★ 必须排在黑名单 drop 之前：白名单语义是"永远放行"，即使该地址
+    #   因历史原因仍在 bl4/bl6 中（例如先被封、后来才加入白名单），
+    #   重启恢复旧封禁后也应立即放行。
+    L.append(f"        ip  saddr @{NFT_TABLE}_wl4 return")
+    L.append(f"        ip6 saddr @{NFT_TABLE}_wl6 return")
+
+    # 黑名单（跟随 DRY_RUN）；放在白名单之后，白名单优先。
     # ★ IPv6 侧同样要带掩码，与 ban() 写入的归一地址保持同一坐标系。
     bl_rule = f"ip  saddr @{NFT_TABLE}_bl4 counter"
     if bl_verdict:
@@ -925,11 +1017,6 @@ def _build_nft_config():
     if bl_verdict:
         bl_rule6 += f" {bl_verdict}"
     L.append(f"        {bl_rule6}")
-
-    # 白名单：用 return，不能用 accept
-    # accept 会跳过整个 PREROUTING hook，破坏 Docker 端口映射
-    L.append(f"        ip  saddr @{NFT_TABLE}_wl4 return")
-    L.append(f"        ip6 saddr @{NFT_TABLE}_wl6 return")
 
     # ICMP echo-request：不加 verdict（包继续走 policy accept）
     # 位置在白名单 return 之后 → 白名单的 ping 不会到达这里
@@ -975,11 +1062,15 @@ def _build_nft_config():
     #     本来就能让第三方被封，FIN+invalid 不比它更强。
     if tcp_ports and ENABLE_FLAG_SCAN:
         flag_matches = (
-            f"tcp dport @{NFT_TABLE}_tcp tcp flags fin "
-            f"ct state invalid,untracked",
-            f"tcp dport @{NFT_TABLE}_tcp "
-            f"tcp flags & (fin|syn|rst|psh|ack|urg) == 0 "
-            f"ct state invalid,untracked",
+            (
+                f"tcp dport @{NFT_TABLE}_tcp tcp flags fin "
+                f"ct state invalid,untracked"
+            ),
+            (
+                f"tcp dport @{NFT_TABLE}_tcp "
+                f"tcp flags & (fin|syn|rst|psh|ack|urg) == 0 "
+                f"ct state invalid,untracked"
+            ),
         )
         for m in flag_matches:
             _emit_log_rule(m, PORT_SCAN_PREFIX, "warn")
@@ -1027,8 +1118,15 @@ def setup_firewall():
         #   否则带 timeout 的 set 元素（形如 "1.2.3.4 timeout 1d expires 23h"）
         #   在回滚时会被 nft -f 拒绝，回滚机制形同虚设。
         r = _nft(["-s", "list", "table", "inet", NFT_TABLE])
-        if r.returncode == 0:
-            backup = r.stdout
+        if r.returncode != 0:
+            # ★ 没有备份就删除旧表，一旦新配置加载失败将无法回滚。
+            #   这里宁可退出让 systemd 告警，也不能主动制造无防护窗口。
+            sys.exit(f"[!] 备份现有 nft 表失败，拒绝删除重建"
+                     f"（表 inet {NFT_TABLE}）：{r.stderr.strip()}")
+        backup = r.stdout
+        if not backup.strip():
+            sys.exit(f"[!] 现有 nft 表备份为空，拒绝删除重建"
+                     f"（表 inet {NFT_TABLE}）")
         old_v4 = _extract_set_elements(f"{NFT_TABLE}_bl4")
         old_v6 = _extract_set_elements(f"{NFT_TABLE}_bl6")
     else:
@@ -1075,8 +1173,7 @@ def setup_firewall():
                     t = BAN_TIME
                 if t <= 0:
                     continue
-                if t > BAN_TIME:
-                    t = BAN_TIME
+                t = min(t, BAN_TIME)
                 # ★ 库里存的是封禁时的原始地址，未必已是归一后的前缀；
                 #   新表的匹配若带掩码（V6_AGG_PREFIXLEN < 128），必须归一后
                 #   再写，否则这些元素躺在表里但永远匹配不到 —— 封禁静默
@@ -1162,33 +1259,58 @@ def open_log_stream():
     """打开内核日志流。
 
     优先级：
-      1. systemd 系统 → journalctl -k -f
+      1. 容器内 → 先尝试挂载的 /var/log/kern.log 等文件
+         容器通常看不到宿主机 journald，README 也明确要求挂载 kern.log；
+         若仍优先 journalctl，挂载的文件永远不会被使用。
+      2. systemd 系统 → journalctl -k -f
          journald 是内核日志的数据源，比文件副本更可靠：
          - 不依赖 rsyslog / syslog-ng 是否安装
          - 不受 zram 日志同步延迟影响
          - 不受 logrotate 轮转 / truncate 影响
-      2. 非 systemd 系统 → /var/log/kern.log → messages → syslog
+      3. 其余情况 → /var/log/kern.log → messages → syslog
 
     性能差异可忽略（毫秒级唤醒，NAS 上无感）。
     """
-    if os.path.isdir("/run/systemd/system") and shutil.which("journalctl"):
-        p = subprocess.Popen(
-            ["journalctl", "-k", "-f", "-n", "0", "-o", "cat"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=False, bufsize=0,
-        )
-        print("[*] 日志来源: journalctl -k -f", flush=True)
-        return p
+    file_paths = ("/var/log/kern.log", "/var/log/messages", "/var/log/syslog")
 
-    for path in ("/var/log/kern.log", "/var/log/messages", "/var/log/syslog"):
-        if os.path.exists(path):
+    def _tail_first_existing():
+        for path in file_paths:
+            if os.path.exists(path):
+                try:
+                    p = subprocess.Popen(
+                        ["tail", "-F", "-n", "0", path],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        text=False, bufsize=0,
+                    )
+                except OSError as e:
+                    print(f"[!] 无法启动 tail -F {path}: {e}", flush=True)
+                    continue
+                print(f"[*] 日志来源: tail -F {path}", flush=True)
+                return p
+        return None
+
+    # 容器内优先使用显式挂载的内核日志文件
+    if _in_container():
+        p = _tail_first_existing()
+        if p is not None:
+            return p
+
+    if os.path.isdir("/run/systemd/system") and shutil.which("journalctl"):
+        try:
             p = subprocess.Popen(
-                ["tail", "-F", "-n", "0", path],
+                ["journalctl", "-k", "-f", "-n", "0", "-o", "cat"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=False, bufsize=0,
             )
-            print(f"[*] 日志来源: tail -F {path}", flush=True)
+        except OSError as e:
+            print(f"[!] 无法启动 journalctl: {e}", flush=True)
+        else:
+            print("[*] 日志来源: journalctl -k -f", flush=True)
             return p
+
+    p = _tail_first_existing()
+    if p is not None:
+        return p
 
     raise RuntimeError("找不到可用的内核日志来源（journalctl / kern.log）")
 
@@ -1227,9 +1349,8 @@ def _load_searcher(xdb_path, ip_version):
         return None
 
     try:
-        import ip2region.util as util
-        import ip2region.searcher as searcher
-    except Exception as e:
+        from ip2region import searcher, util
+    except Exception as e:  # noqa: BLE001 - 第三方库导入失败原因多样，统一降级为离线查询不可用
         print(f"[!] py-ip2region 未安装或导入失败: {e}", flush=True)
         return None
 
@@ -1249,8 +1370,8 @@ def _load_searcher(xdb_path, ip_version):
             continue
         try:
             return fn(ver, xdb_path)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - 兼容不同版本 API，失败后继续尝试下一种
+            print(f"[!] 离线库加载 API {api_name} 失败: {e}", flush=True)
 
     # 回退：手工加载向量索引再建 searcher
     # （兼容 snake_case 与 camelCase 两种 API 命名）
@@ -1268,10 +1389,11 @@ def _load_searcher(xdb_path, ip_version):
                 continue
             try:
                 return fn(ver, xdb_path, vec)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as e:  # noqa: BLE001 - 兼容不同版本 API，失败后统一报错
+                print(f"[!] 离线库向量索引 API {api_name} 失败: {e}",
+                      flush=True)
+    except Exception as e:  # noqa: BLE001 - 回退路径整体失败，最终会打印统一错误
+        print(f"[!] 离线库向量索引加载失败: {e}", flush=True)
 
     print(f"[!] {xdb_path} 无法通过任何已知 API 加载", flush=True)
     return None
@@ -1290,7 +1412,7 @@ def init_ip_lookup():
     try:
         _db_conn = sqlite3.connect(DB_PATH, timeout=10,
                                    check_same_thread=False)
-    except Exception as e:
+    except (sqlite3.Error, OSError) as e:
         sys.exit(f"[!] 打开数据库失败 {DB_PATH}: {e}")
     _db_conn.execute("PRAGMA journal_mode=WAL")
     _db_conn.execute("PRAGMA synchronous=NORMAL")
@@ -1360,7 +1482,7 @@ def _cleanup_db():
                 _db_conn.execute("VACUUM")
                 _db_conn.commit()
                 print("[*] VACUUM 完成", flush=True)
-    except Exception as e:
+    except (sqlite3.Error, OSError) as e:
         print(f"[!] 清理旧记录失败: {e}", flush=True)
 
 
@@ -1391,7 +1513,10 @@ def _query_offline(ip: str) -> dict:
     if searcher is None:
         return {}
     try:
-        region = searcher.search(ip)
+        # Searcher 内部文件句柄不可并发复用；离线查询统一串行化，
+        # 防止未来新增调用点后出现并发 seek/read。
+        with _ip_lookup_lock:
+            region = searcher.search(ip)
         if not region:
             return {}
         # 官方 ip2region_v4/v6.xdb 字段格式：
@@ -1406,7 +1531,7 @@ def _query_offline(ip: str) -> dict:
             "city":     _region_field(parts[2]),
             "isp":      _region_field(parts[3]),
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - 离线库是第三方解析，查询失败不能影响封禁
         print(f"[!] 离线查询失败 {ip}: {e}", flush=True)
         return {}
 
@@ -1426,7 +1551,8 @@ def _query_online(ip: str) -> dict:
         return {}
     try:
         import requests
-    except Exception:
+    except ImportError:
+        # requests 是可选依赖；未安装时静默禁用在线查询，离线库仍可用。
         return {}
     try:
         resp = requests.get(
@@ -1450,7 +1576,7 @@ def _query_online(ip: str) -> dict:
             "city":     data.get("city")       or UNKNOWN,
             "isp":      data.get("isp")        or UNKNOWN,
         }
-    except Exception as e:
+    except (requests.RequestException, ValueError, TypeError, AttributeError) as e:
         _online_fail_until = time.time() + ONLINE_FAIL_BACKOFF
         print(f"[!] 在线查询失败 {ip}: {e}"
               f"（{ONLINE_FAIL_BACKOFF}s 内不再尝试在线查询）", flush=True)
@@ -1613,7 +1739,7 @@ def _warn_table_lost():
 # ---------------- 归属地记录异步写入 ----------------
 
 def _offline_info(ip: str) -> dict:
-    """只查离线库并补齐字段。供记录队列打满时的同步降级使用。
+    """只查离线库并补齐字段。供退出阶段避免在线查询时使用。
 
     不碰 _ip_info_cache / 熔断状态：这些只由后台线程通过 get_ip_info() 访问，
     避免两个线程同时改动字典和缓存淘汰。
@@ -1651,7 +1777,7 @@ def _write_record(job, allow_online=True):
                 ),
             )
             _db_conn.commit()
-    except Exception as e:
+    except (sqlite3.Error, OSError) as e:
         print(f"[!] 写库失败 {job['ip']}: {e}", flush=True)
 
     if job["kind"] == "icmp":
@@ -1680,26 +1806,46 @@ def _record_worker_loop():
                 return
             continue
         try:
-            _write_record(job)
-        except Exception as e:
+            # 退出阶段只查离线库，避免在线查询（最长数秒）拖住退出。
+            _write_record(job, allow_online=not _record_stop.is_set())
+        except Exception as e:  # noqa: BLE001 - 单条记录失败不能终止写库线程
             print(f"[!] 记录处理异常 {job.get('ip')}: {e}", flush=True)
 
 
 def _enqueue_record(job):
-    """把记录交给后台线程；队列打满时降级为离线值同步写库。"""
-    global _last_queue_warn_ts
+    """把记录交给后台线程；队列打满时挤掉最旧一条并保留最新，绝不阻塞主线程。"""
+    global _last_queue_warn_ts, _queue_dropped_total
     try:
         _record_queue.put_nowait(job)
         return
     except queue.Full:
         pass
 
+    evicted = False
+    try:
+        _record_queue.get_nowait()
+        evicted = True
+    except queue.Empty:
+        pass
+
+    enqueued = False
+    try:
+        _record_queue.put_nowait(job)
+        enqueued = True
+    except queue.Full:
+        pass
+
+    if evicted:
+        _queue_dropped_total += 1
+    if not enqueued:
+        _queue_dropped_total += 1
+
     now = time.time()
     if now - _last_queue_warn_ts >= 60:
         _last_queue_warn_ts = now
-        print(f"[!] 归属地记录队列已满（{_RECORD_QUEUE_MAX} 条），"
-              f"记录降级为离线归属地同步写库", flush=True)
-    _write_record(job, allow_online=False)
+        action = "已挤掉最旧一条并保留最新" if enqueued else "最新记录也未能入队"
+        print(f"[!] 归属地记录队列已满（{_RECORD_QUEUE_MAX} 条），{action}；"
+              f"累计丢弃 {_queue_dropped_total} 条", flush=True)
 
 
 def _start_record_worker():
@@ -1710,19 +1856,23 @@ def _start_record_worker():
     _record_worker.start()
 
 
-def _stop_record_worker():
+def _stop_record_worker() -> bool:
+    """停止写库线程。返回 True 表示线程已结束，可以安全关闭数据库连接。"""
     global _record_worker
     if _record_worker is None:
-        return
+        return True
     _record_stop.set()
     _record_worker.join(timeout=10)
     if _record_worker.is_alive():
-        print(f"[!] 退出超时：仍有 {_record_queue.qsize()} 条归属地记录未写库",
-              flush=True)
+        print(f"[!] 退出超时：仍有 {_record_queue.qsize()} 条归属地记录未写库；"
+              f"跳过关闭数据库连接，避免写线程访问已关闭的连接", flush=True)
+        return False
     _record_worker = None
+    return True
 
 
-def ban(ip: str, port: int = None, protocol: str = None,
+def ban(ip: str, port: Optional[int] = None,  # noqa: UP045 - 保持 Python 3.7 兼容
+        protocol: Optional[str] = None,  # noqa: UP045 - 保持 Python 3.7 兼容
         kind: str = "scan", event_type: str = "port_scan"):
     """把 IP 加入 nft 黑名单并记录。
 
@@ -1773,32 +1923,46 @@ def ban(ip: str, port: int = None, protocol: str = None,
         if r.returncode == 0:
             return
 
-        r = _nft(["add", "element", "inet", NFT_TABLE, setname,
-                  f"{{ {set_key} timeout {BAN_TIME}s }}"])
-        if r.returncode == 0:
-            result = "ban"
-        else:
+        # ★ get 的失败分两类：元素不存在要继续 add；nft 超时/权限错误
+        #   则必须停下。后者若被当成"不存在"继续 add，会把已存在元素的
+        #   timeout 重置为 BAN_TIME，持续扫描者可能被无限续期。
+        get_err = (r.stderr or "").strip()
+        lower_err = get_err.lower()
+        absent = ("no such file or directory" in lower_err
+                  or "not found" in lower_err
+                  or "does not exist" in lower_err)
+        if not absent:
+            print(f"[!] 查询封禁元素失败 {set_key}"
+                  f"（inet {NFT_TABLE} / {setname}），跳过本次 add: "
+                  f"{get_err or 'unknown error'}", flush=True)
             result = "ban_failed"
-            print(f"[!] nft 添加元素失败 {set_key}"
-                  f"（inet {NFT_TABLE} / {setname}）: {r.stderr.strip()}",
-                  flush=True)
-            # ★ "No such file or directory" 通常不是元素本身的问题，而是
-            #   整张表被别人删了（systemctl restart nftables、nft flush
-            #   ruleset、Docker 重配网络等）。此时 drop 规则也没了，等于
-            #   完全没有防护，而脚本只会不停打 ban_failed —— 必须显式喊出来。
-            if "No such file or directory" in (r.stderr or ""):
-                _warn_table_lost()
-            # ★ "Too many open files in system"（ENFILE）实测是 **set 满** 的
-            #   文案，和 fd 耗尽毫无关系。不点破的话运维第一反应是去查
-            #   ulimit -n，方向完全跑偏。
-            elif "Too many open files" in (r.stderr or ""):
-                cap = SET6_MAXELEM if is_v6 else SET4_MAXELEM
-                print(f"[!] 上一条不是 fd 耗尽，是黑名单 set 已满"
-                      f"（{setname} 容量 {cap}）。新来源将不再被封禁，"
-                      f"已封的仍按剩余时间过期释放。扩容：调大 "
-                      f"{'SET6' if is_v6 else 'SET4'}_MAXELEM 后重启，"
-                      f"或临时 nft flush set inet {NFT_TABLE} {setname}",
+        else:
+            r = _nft(["add", "element", "inet", NFT_TABLE, setname,
+                      f"{{ {set_key} timeout {BAN_TIME}s }}"])
+            if r.returncode == 0:
+                result = "ban"
+            else:
+                result = "ban_failed"
+                print(f"[!] nft 添加元素失败 {set_key}"
+                      f"（inet {NFT_TABLE} / {setname}）: {r.stderr.strip()}",
                       flush=True)
+                # ★ "No such file or directory" 通常不是元素本身的问题，而是
+                #   整张表被别人删了（systemctl restart nftables、nft flush
+                #   ruleset、Docker 重配网络等）。此时 drop 规则也没了，等于
+                #   完全没有防护，而脚本只会不停打 ban_failed —— 必须显式喊出来。
+                if "No such file or directory" in (r.stderr or ""):
+                    _warn_table_lost()
+                # ★ "Too many open files in system"（ENFILE）实测是 **set 满** 的
+                #   文案，和 fd 耗尽毫无关系。不点破的话运维第一反应是去查
+                #   ulimit -n，方向完全跑偏。
+                elif "Too many open files" in (r.stderr or ""):
+                    cap = SET6_MAXELEM if is_v6 else SET4_MAXELEM
+                    print(f"[!] 上一条不是 fd 耗尽，是黑名单 set 已满"
+                          f"（{setname} 容量 {cap}）。新来源将不再被封禁，"
+                          f"已封的仍按剩余时间过期释放。扩容：调大 "
+                          f"{'SET6' if is_v6 else 'SET4'}_MAXELEM 后重启，"
+                          f"或临时 nft flush set inet {NFT_TABLE} {setname}",
+                          flush=True)
 
     # 只有真正写进黑名单（result="ban"）才算封禁时长；
     # DRY_RUN 与 ban_failed 都没有实际生效，记 0 以免统计被高估。
@@ -2031,7 +2195,7 @@ def _in_container() -> bool:
         try:
             with open(path, "r") as f:
                 content = f.read()
-        except Exception:
+        except OSError:
             continue
         if any(x in content for x in markers):
             return True
@@ -2052,8 +2216,8 @@ def _startup_selfcheck():
                     print(f"[!] nf_log_all_netns = {v}（容器部署应为 1）。"
                           f"宿主执行: sysctl -w net.netfilter.nf_log_all_netns=1",
                           flush=True)
-        except Exception:
-            pass
+        except OSError as e:
+            print(f"[!] 启动自检：读取 nf_log_all_netns 失败: {e}", flush=True)
 
     # NET_ADMIN（容器需 --cap-add=NET_ADMIN；无需 NET_RAW）
     if shutil.which("capsh"):
@@ -2137,8 +2301,12 @@ def main():
               "（不占 per-IP 配额）", flush=True)
     print(f"[*] 数据库：{DB_PATH}", flush=True)
     if DB_RETENTION_DAYS > 0:
+        if DB_CLEANUP_INTERVAL >= 3600:
+            every = f"{DB_CLEANUP_INTERVAL // 3600} 小时"
+        else:
+            every = f"{max(1, DB_CLEANUP_INTERVAL // 60)} 分钟"
         print(f"[*] 保留策略：最近 {DB_RETENTION_DAYS} 天，"
-              f"每 {DB_CLEANUP_INTERVAL // 3600} 小时检查一次", flush=True)
+              f"每 {every}检查一次", flush=True)
     else:
         print("[*] 保留策略：不清理（DB_RETENTION_DAYS <= 0）", flush=True)
     if _searcher_v4 is None:
@@ -2184,7 +2352,7 @@ def main():
                 else:
                     open_fail_count = 0
                     print("[!] 日志流已中断，5 秒后重连…", flush=True)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - 日志循环边界，任何异常都应重连而不是退出
             open_fail_count += 1
             if not _shutdown_requested:
                 print(f"[!] 日志流异常（连续 {open_fail_count} 次）: {e}，"
@@ -2200,9 +2368,10 @@ def main():
                         try:
                             proc.wait(timeout=1)
                         except subprocess.TimeoutExpired:
-                            pass
-                except Exception:
-                    pass
+                            print(f"[!] 日志进程 {proc.pid} 未能终止，"
+                                  f"可能残留到下次启动", flush=True)
+                except (OSError, subprocess.SubprocessError) as e:
+                    print(f"[!] 终止日志进程失败: {e}", flush=True)
         if not _shutdown_requested:
             if open_fail_count >= 5:
                 # 没有可用的日志源 = 永远不会触发封禁。继续以 active 状态
@@ -2221,10 +2390,15 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[*] 已退出")
     finally:
-        # 先停后台写库线程，再关数据库连接
-        _stop_record_worker()
+        # 先停后台写库线程，再关数据库连接；线程未结束时不能 close，
+        # 否则它会继续向已关闭的 sqlite 连接写入。
+        worker_stopped = _stop_record_worker()
         if _db_conn is not None:
-            try:
-                _db_conn.close()
-            except Exception:
-                pass
+            if worker_stopped:
+                try:
+                    _db_conn.close()
+                except (sqlite3.Error, OSError) as e:
+                    print(f"[!] 关闭数据库连接失败: {e}", flush=True)
+            else:
+                print("[!] 数据库连接未显式关闭：后台写库线程未结束，"
+                      "交由进程退出回收", flush=True)

@@ -258,11 +258,11 @@ EXTRA_WHITELIST = [
 ]
 ```
 
-白名单来源访问监测端口也不会被封。
+白名单来源访问监测端口也不会被封。`EXTRA_WHITELIST` 与 `PRIVATE_NETS` / `LOOPBACK_NETS` 是**并集**：完全重复或包含/重叠的网段会在生成 nft 配置时自动折叠，不会再触发 `conflicting intervals`。这也意味着写一个私网子网（例如 `192.168.1.0/24`）**不会收紧**默认的 `192.168.0.0/16`；要收紧私网范围，请直接修改 `PRIVATE_NETS`。
 
 **`BAN_DEDUP_WINDOW`**
 
-默认 10 秒。同一 IP 的**同类事件**（端口扫描 / ICMP 各自独立）在窗口期内只处理一次，避免日志刷屏时反复写库 / 调 nft。库增长太快可调大（如 300）。
+默认 10 秒。同一来源（IPv6 聚合时按前缀；ICMP 记录路径按 IP）的**同类事件**（端口扫描 / ICMP 各自独立）在窗口期内只处理一次，避免日志刷屏时反复写库 / 调 nft。库增长太快可调大（如 300）。
 
 **`V6_AGG_PREFIXLEN`（IPv6 聚合前缀，默认 `128` = 不聚合）**
 
@@ -292,7 +292,7 @@ IPv6 的封禁与日志配额按这个前缀长度聚合：`128` 表示**逐地�
 
 白名单按网段匹配（`flags interval`），不受聚合影响。
 
-> **白名单与聚合的交互（只在调成 `< 128` 后才有意义）**：黑名单规则的顺序在**白名单之前**（封禁优先）。所以如果你在 `EXTRA_WHITELIST` 里放的是单个 `/128` 地址（如 `2001:db8:77::a1/128`），而同前缀的另一个地址触发了封禁，整个 `2001:db8:77::/64` 会被 drop——白名单里那个地址也跟着被拦。开启聚合时，v6 的白名单条目建议直接写 `/64` 前缀，与聚合粒度对齐。
+> **白名单与聚合的交互（只在调成 `< 128` 后才有意义）**：白名单规则现在排在**黑名单之前**（白名单优先）。即使同前缀的其他地址触发了 `/64` 聚合封禁，`EXTRA_WHITELIST` 里的单个 `/128` 地址仍会先 `return` 放行。反过来说，白名单写得越宽（例如整个 `/64`），放行面就越大，请按实际需要配置。
 
 | 值 | 效果 |
 | --- | --- |
@@ -384,6 +384,8 @@ nft 的规则语句顺序执行、任一 match 失败即中断整条规则，所
 | `LOG_QUOTA_SET4/6_MAXELEM`、`SET4/6_MAXELEM` 为正整数 | `size 0` 时 nft 的报错会**错位到别的行**（实测报的是后面那行的 `unexpected '}'`），根本看不出是 size 写错了。黑名单两项与日志配额是两套 set，各自校验 |
 | `V6_AGG_PREFIXLEN` 在 `32`–`128` 内 | 越界会让 `ipaddress` 抛异常；比 `/32` 更粗的前缀会把海量无关地址并进同一个封禁槽位，一次误判等于封掉一大片 |
 | `NFT_PREROUTING_PRIORITY` 为整数 | 生成的是 `priority -110;`，写成字符串或 `dstnat - 10` 这类表达式会直接语法错误 |
+| 开关类配置必须是 `True`/`False`（bool） | `DRY_RUN = "False"` 在 Python 里仍是真值，会让防护静默变成只记录不封禁；`DESTROY_TABLE_ON_EXIT` 等同理 |
+| 数值参数类型与下限 | `CMD_TIMEOUT` / `BAN_DEDUP_WINDOW` / `IP_INFO_CACHE_*` / `DB_CLEANUP_INTERVAL` 等必须是满足下限的整数，`DB_RETENTION_DAYS` 必须是整数（`<=0` 表示不清理）；写错类型会让日志消费循环反复异常重连 |
 
 两类情况只告警、不退出：
 
@@ -483,8 +485,9 @@ WorkingDirectory=/root/port_scan_guard
 Restart=always
 RestartSec=5
 
-# systemctl stop/restart 时给脚本 10 秒优雅退出，超时 SIGKILL
-TimeoutStopSec=10
+# systemctl stop/restart 时给脚本 30 秒优雅退出：
+# 日志消费停止 + 写库线程最多等 10 秒 + nft 清理命令，10 秒不够
+TimeoutStopSec=30
 
 StandardOutput=journal
 StandardError=journal
@@ -538,7 +541,7 @@ sudo journalctl -u port-scan-guard -f
 
 > 内核原始日志（nft log）在 `journalctl -k`，前缀为 `HOST_SCAN:` / `HOST_ICMP:`；服务日志则是脚本处理后的上面这种格式。
 
-> 归属地查询与写库在后台线程完成，nft 封禁和日志消费不等它，因此记录行可能比 `[!] nft ...` 警告稍晚出现。记录队列上限约 2 万条，打满后新记录降级为离线归属地立即写库；退出时最多等 10 秒把队列写完，超时会打印剩余条数后放弃。
+> 归属地查询与写库在后台线程完成，nft 封禁和日志消费不等它，因此记录行可能比 `[!] nft ...` 警告稍晚出现。记录队列上限约 2 万条，打满时**挤掉最旧一条并保留最新**（日志消费主线程绝不同步写库），累计丢弃条数会显示在限频警告里；退出时最多等 10 秒把队列写完，超时会打印剩余条数并跳过显式关闭数据库连接，交由进程退出回收。因此 systemd 单元的 `TimeoutStopSec` 应不低于 30 秒，给写库线程和 nft 清理留出时间。
 
 ### 9.2 检查是否误伤自己
 
@@ -748,7 +751,7 @@ sudo systemctl restart port-scan-guard
 | 日志里出现 `[!!] nft 表 ... 已不存在` | 有人/别的服务删了整张表（`systemctl restart nftables`、`nft flush ruleset`、Docker 重配网络）。此时**规则和黑名单全没了**，脚本只会写 `ban_failed` | `nft list table inet port_scan_guard_host` 确认；`systemctl restart port-scan-guard` 重建。脚本不会自动重建，详见下方说明 |
 | 启动即退出，提示「配置校验未通过」 | 表名/前缀/速率/端口清单有非法值 | 按提示逐条改脚本顶部配置区；`journalctl -u port-scan-guard -n 20 --no-pager` 看完整清单 |
 
-> 注意：日志源本身不可用时，脚本不会退出，而是每 5 秒自动重连；真正导致进程退出的通常是 `setup_firewall` 的 nft 配置/权限失败。
+> 注意：日志源本身不可用时，脚本会每 5 秒自动重连；连续 5 次仍不可用则退出，由 systemd 重启/告警，避免进程显示 `active` 却永远收不到日志。`setup_firewall` 的 nft 配置/权限失败会立即退出。
 
 常用命令：
 
@@ -802,6 +805,8 @@ sudo sysctl -w net.netfilter.nf_log_all_netns=1
 ```bash
 -v /var/log/kern.log:/var/log/kern.log:ro
 ```
+
+容器内会**优先** tail 这个挂载文件；只有文件不存在时才回退到 `journalctl -k -f`（容器通常看不到宿主机 journald）。
 
 **4. 前缀与表名：容器和宿主必须区分**
 
@@ -889,7 +894,7 @@ ExecStart=/root/port_scan_guard/venv/bin/python3 /root/port_scan_guard/port_scan
 WorkingDirectory=/root/port_scan_guard
 Restart=always
 RestartSec=5
-TimeoutStopSec=10
+TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
 
