@@ -56,7 +56,7 @@
 **默认放行的地址**
 
 - 私网段：`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`fc00::/7`、`fe80::/10`。
-- 回环、未指定、多播地址一律放行（不是攻击）。
+- 回环（`127.0.0.0/8`、`::1`）在用户态与 nft 白名单两侧都放行；未指定/多播源地址不会触发封禁（它们本身不是合法源地址，nft 仍会按扫描规则丢弃）。
 - IPv4-mapped IPv6（`::ffff:a.b.c.d`）会自动归一为 IPv4 处理，避免误写入 IPv6 黑名单却拦不住 IPv4 流量。
 - IPv6 默认**逐地址**封禁（`V6_AGG_PREFIXLEN = 128`），封谁就是谁，与 IPv4 封一个公网 IP 完全对称，不存在"连带封掉同网段别人"的问题。若确认面临"每包换一个源地址"的扫描压力，可以把 `V6_AGG_PREFIXLEN` 调到 `64` 开启聚合——代价是一次误判会波及整个前缀，详见 [`V6_AGG_PREFIXLEN`](#62-必须确认的配置项)。
 
@@ -374,7 +374,8 @@ nft 的规则语句顺序执行、任一 match 失败即中断整条规则，所
 | --- | --- |
 | 表名只含字母/数字/`_`/`.`/`-` | 含空格等字符会拼出非法 nft 语句 |
 | 前缀非空、不含 `"` 与换行、≤120 **字节**（UTF-8 编码后，中文 1 字 3 字节） | 前缀是直接拼进 `log prefix "..."` 的；实测 127 字节 nft 就报 `log prefix is too long` |
-| 两个前缀不相等、且不互为子串 | **这类错误 nft 不会报，只会静默失效**：所有扫描日志都被判成 ICMP 探测，端口扫描永不封禁 |
+| 两个前缀不相等，且 `ICMP_PROBE_PREFIX` 不是 `PORT_SCAN_PREFIX` 的子串 | **这类错误 nft 不会报，只会静默失效**：所有扫描日志都被判成 ICMP 探测，端口扫描永不封禁 |
+| `PRIVATE_NETS` / `LOOPBACK_NETS` / `EXTRA_WHITELIST` 的每个元素都是 `ip_network` 对象 | 误写成字符串时 `_build_nft_config()` 访问 `.version` 会抛 `AttributeError`，报错信息与配置项完全对不上 |
 | 端口在 1~65535 内 | 越界值会写进 nft set，整表加载失败 |
 | 速率形如 `1/second`、`timeout` 带单位且数值 ≥ 1 | 实测 `timeout 60`（漏单位）直接语法错误，而 nft 的报错只给行号；`rate 0/second` 会被 nft 拒绝导致整表加载失败；`timeout 0s` 语法合法但实测含义是「无超时」——元素永不释放，配额 set 只增不减，满了该族新源就不写日志、不进黑名单，且启动无任何报错 |
 | `BAN_TIME` / `burst` 为正整数 | 拼进 `timeout 86400s` / `burst N`，非法值整表加载失败 |
@@ -616,7 +617,7 @@ sudo nft delete element inet port_scan_guard_host port_scan_guard_host_bl6 '{ <I
 
 - `event_type`：`port_scan`（端口扫描）/ `icmp`（ICMP 探测）。
 - `result`：`dry_run` / `ban` / `ban_failed` / `icmp_probe`。
-- `duration`：实际封禁秒数（`ban` 为 `BAN_TIME`）；`dry_run` 与 `icmp_probe` 均为 `0`。ICMP 封禁（`result=ban`）同样记 `BAN_TIME`。
+- `duration`：实际封禁秒数（`ban` 为 `BAN_TIME`）；`dry_run`、`ban_failed` 与 `icmp_probe` 均为 `0`（后两者没有真正生效，记 0 避免统计被高估）。ICMP 封禁（`result=ban`）同样记 `BAN_TIME`。
 - ICMP 记录的 `port` 为 `NULL`（两种模式都是）。
 - 同一 IP 已在黑名单中时**不会重复写库**（既不续期也不再记录），因此单个攻击者 24 小时内最多留下一条 `ban` 记录。
 
@@ -830,6 +831,8 @@ sudo rm -rf /root/port_scan_guard
 ```
 
 只临时停服保留配置：`systemctl stop` 即可。默认 `DESTROY_TABLE_ON_EXIT = False`，停服后 nft 表和黑名单元素保留，但 `prerouting` 链规则被 flush——停服期间不拦截。
+
+> 只有主动停服（SIGTERM/SIGINT）才会清理规则。若进程因未捕获异常崩溃，`atexit` 会**保留** nft 规则不 flush（fail-closed），避免崩溃到重启的窗口内监测端口裸奔；代价是此时不再产生新封禁，需靠 systemd 重启恢复。
 
 ---
 

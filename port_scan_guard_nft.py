@@ -29,6 +29,7 @@ port_scan_guard_nft.py
 """
 
 import atexit
+import heapq
 import ipaddress
 import json
 import os
@@ -190,6 +191,14 @@ PRIVATE_NETS = [
     ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
+]
+
+# 回环网段：用户态 is_whitelisted() 对回环一律放行（is_loopback），
+# nft 白名单必须保持一致，否则本机进程访问监测端口（如 127.0.0.1:8080）
+# 会在 PREROUTING 被静默丢弃——而且因为用户态判定为白名单，库里还没有记录。
+LOOPBACK_NETS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
 ]
 
 # 额外白名单（公网 IP / 网段）。
@@ -637,6 +646,18 @@ def _validate_config():
                     or not (1 <= p <= 65535):
                 errs.append(f"{name} 含非法端口 {p!r}（应为 1~65535 的整数）")
 
+    # ---- 白名单网段 ----
+    # ★ _build_nft_config() 直接访问每个元素的 .version；若配置区误写成
+    #   字符串，会在 nft 加载阶段抛 AttributeError，错误信息完全对不上配置。
+    for name, nets in (("PRIVATE_NETS", PRIVATE_NETS),
+                       ("LOOPBACK_NETS", LOOPBACK_NETS),
+                       ("EXTRA_WHITELIST", EXTRA_WHITELIST)):
+        for n in nets:
+            if not isinstance(n, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+                errs.append(
+                    f"{name} 含非网段元素 {n!r}：必须用 "
+                    f"ipaddress.ip_network(...) 构造，不能直接写字符串")
+
     # ---- 速率 / 超时 ----
     if not _RATE_RE.match(str(LOG_QUOTA_RATE).strip()):
         errs.append(f"LOG_QUOTA_RATE={LOG_QUOTA_RATE!r} 格式应为 "
@@ -703,10 +724,11 @@ def _validate_config():
         errs.append(f"NFT_PREROUTING_PRIORITY={NFT_PREROUTING_PRIORITY!r} "
                     f"必须是整数（默认 -110）。本项目生成的是 "
                     f"`priority -110;`，字符串或表达式会直接语法错误")
-    elif NFT_PREROUTING_PRIORITY > -100:
-        print(f"[!] NFT_PREROUTING_PRIORITY={NFT_PREROUTING_PRIORITY} 晚于 "
-              f"Docker DNAT(-100)：Docker 映射端口的 dport 已被改写，"
-              f"清单里的宿主机端口可能匹配不到（无 Docker 时无影响）",
+    elif NFT_PREROUTING_PRIORITY >= -100:
+        print(f"[!] NFT_PREROUTING_PRIORITY={NFT_PREROUTING_PRIORITY} "
+              f"不早于 Docker DNAT(-100)：等于 -100 时同优先级内各 chain "
+              f"执行顺序不确定；大于 -100 时 dport 已被改写，清单里的"
+              f"宿主机端口可能匹配不到（无 Docker 时无影响）",
               flush=True)
 
     # ---- 开关组合 ----
@@ -727,8 +749,9 @@ def _build_nft_config():
     tcp_ports = sorted(set(TCP_PORTS))
     udp_ports = sorted(set(UDP_PORTS))
 
-    wl4 = [n for n in (PRIVATE_NETS + EXTRA_WHITELIST) if n.version == 4]
-    wl6 = [n for n in (PRIVATE_NETS + EXTRA_WHITELIST) if n.version == 6]
+    wl_nets = PRIVATE_NETS + LOOPBACK_NETS + EXTRA_WHITELIST
+    wl4 = [n for n in wl_nets if n.version == 4]
+    wl6 = [n for n in wl_nets if n.version == 6]
 
     # DRY_RUN 时 verdict 为空字符串（规则只 log / 只 counter，不加 verdict）
     # 这样不会用 accept 跳过 Docker DNAT，包继续流向下一个 chain
@@ -978,6 +1001,12 @@ def setup_firewall():
     if shutil.which("nft") is None:
         sys.exit("[!] 未找到 nft 命令，请先安装：apt install nftables")
 
+    # ★ 先生成新配置，确认不会抛异常后再动旧表。
+    #   _build_nft_config() 会访问白名单网段的 .version 等属性；一旦配置区
+    #   写错（例如 EXTRA_WHITELIST 塞了字符串），若沿用"先删表再生成"，
+    #   旧规则已被删除且没有回滚路径，故障窗口内所有端口裸奔。
+    config = _build_nft_config()
+
     # 备份 + 恢复封禁记录
     backup = None
     if _nft_table_exists():
@@ -995,8 +1024,7 @@ def setup_firewall():
     # 删除旧表
     _nft(["delete", "table", "inet", NFT_TABLE])
 
-    # 加载新配置
-    config = _build_nft_config()
+    # 加载新配置（已在上方、删除旧表之前生成）
     r = _nft_load(config)
     if r.returncode != 0:
         # ★ 回滚：重新加载备份，保证系统不裸奔
@@ -1099,6 +1127,16 @@ def cleanup_firewall():
     """
     global _firewall_setup_done
     if not _firewall_setup_done:
+        return
+
+    # ★ 只有主动停服（SIGTERM/SIGINT）才拆规则。未捕获异常导致进程崩溃时
+    #   atexit 同样会执行到这里；此时若 flush 掉 chain，监测端口会在崩溃到
+    #   重启的窗口内完全裸奔（若触发 systemd 启动限流则更久）。保留规则是
+    #   更安全的 fail-closed 选择：只是不再新增封禁，已有防护仍在。
+    if not _shutdown_requested:
+        print("[!] 非正常退出：保留 nft 规则（不 flush），"
+              "避免监测端口在崩溃窗口内失去防护", flush=True)
+        _firewall_setup_done = False
         return
 
     if DESTROY_TABLE_ON_EXIT:
@@ -1204,8 +1242,10 @@ def _load_searcher(xdb_path, ip_version):
             pass
 
     # 回退：手工加载向量索引再建 searcher
-    # （部分版本没有 loadVectorIndexFromFile，用 getattr 避免 AttributeError）
-    load_vec = getattr(util, "loadVectorIndexFromFile", None)
+    # （py-ip2region 3.x 是 snake_case，旧版本是 camelCase，两者都试）
+    load_vec = getattr(util, "load_vector_index_from_file", None)
+    if load_vec is None:
+        load_vec = getattr(util, "loadVectorIndexFromFile", None)
     if load_vec is None:
         print(f"[!] {xdb_path} 无法通过任何已知 API 加载", flush=True)
         return None
@@ -1328,6 +1368,17 @@ def _maybe_cleanup_db():
 
 # ---------------- 归属地查询 ----------------
 
+def _region_field(part: str) -> str:
+    """归一化 xdb 的单个字段。
+
+    ★ 官方 xdb 用字符串 "0"（而不是空串）表示未知字段，直接 `or UNKNOWN`
+      接不住："0" 是真值，会原样写进数据库，还会让 get_ip_info() 误判为
+      "字段已知" 而跳过在线补充。
+    """
+    part = (part or "").strip()
+    return UNKNOWN if not part or part == "0" else part
+
+
 def _query_offline(ip: str) -> dict:
     searcher = _searcher_v6 if ":" in ip else _searcher_v4
     if searcher is None:
@@ -1336,14 +1387,19 @@ def _query_offline(ip: str) -> dict:
         region = searcher.search(ip)
         if not region:
             return {}
+        # ★ 官方 ip2region_v4/v6.xdb 的字段格式：
+        #     Country|Province|City|ISP|iso-alpha2-code
+        #   没有单独的"区域"段，所以 province 在 parts[1]、city 在 parts[2]、
+        #   ISP 在 parts[3]。旧版 5 段格式（Country|Region|Province|City|ISP）
+        #   索引整体右移一位，不能再按 parts[2..4] 取。
         parts = region.split("|")
-        if len(parts) < 5:
+        if len(parts) < 4:
             return {}
         return {
-            "country":  parts[0] or UNKNOWN,
-            "province": parts[2] or UNKNOWN,
-            "city":     parts[3] or UNKNOWN,
-            "isp":      parts[4] or UNKNOWN,
+            "country":  _region_field(parts[0]),
+            "province": _region_field(parts[1]),
+            "city":     _region_field(parts[2]),
+            "isp":      _region_field(parts[3]),
         }
     except Exception as e:
         print(f"[!] 离线查询失败 {ip}: {e}", flush=True)
@@ -1351,7 +1407,8 @@ def _query_offline(ip: str) -> dict:
 
 
 def _query_online(ip: str) -> dict:
-    # ★ 在线查询在封禁路径上串行执行，失败时最坏阻塞 ONLINE_TIMEOUT 秒，
+    # ★ 在线查询在封禁路径上串行执行，失败时最坏阻塞 ONLINE_TIMEOUT 秒
+    #   （DNS 解析在 requests timeout 之外，解析异常慢时会更久），
     #   且每个新 IP 都会重试一次 → 批量新 IP 时封禁严重滞后、日志刷屏。
     #   因此失败后熔断一段时间，期间直接跳过（不影响离线库命中）。
     global _online_fail_until
@@ -1373,8 +1430,15 @@ def _query_online(ip: str) -> dict:
             timeout=ONLINE_TIMEOUT,
             headers={"User-Agent": "port-scan-guard/1.0"},
         )
+        # ★ 免费额度耗尽时 ip-api 返回 HTTP 429 + 正常 JSON 体，不会抛异常；
+        #   不显式 raise 的话下面只能看到 status=fail，熔断永远不触发，
+        #   每次封禁仍会继续打网络。
+        resp.raise_for_status()
         data = resp.json()
         if data.get("status") != "success":
+            _online_fail_until = time.time() + ONLINE_FAIL_BACKOFF
+            print(f"[!] 在线查询失败 {ip}: {data.get('message') or data}"
+                  f"（{ONLINE_FAIL_BACKOFF}s 内不再尝试在线查询）", flush=True)
             return {}
         return {
             "country":  data.get("country")    or UNKNOWN,
@@ -1410,8 +1474,9 @@ def _cache_put(ip: str, info: dict):
         #   丢掉最旧的部分，保证有硬上限（丢掉只是下次重新查询，无副作用）。
         extra = len(_ip_info_cache) - IP_INFO_CACHE_MAX
         if extra > 0:
-            for k, _ in sorted(_ip_info_cache.items(),
-                               key=lambda kv: kv[1][0])[:extra]:
+            # 只取最旧的 extra 条，避免每次都用全量 sorted()（O(n log n)）。
+            for k, _ in heapq.nsmallest(
+                    extra, _ip_info_cache.items(), key=lambda kv: kv[1][0]):
                 _ip_info_cache.pop(k, None)
 
 
@@ -1623,8 +1688,9 @@ def ban(ip: str, port: int = None, protocol: str = None,
 
     info = get_ip_info(ip)
 
-    # DRY_RUN 下并没有真的封禁，duration 记 0 更符合实际语义
-    duration = 0 if result == "dry_run" else BAN_TIME
+    # 只有真正写进黑名单（result="ban"）才算封禁时长；
+    # DRY_RUN 与 ban_failed 都没有实际生效，记 0 以免统计被高估。
+    duration = BAN_TIME if result == "ban" else 0
 
     try:
         _db_conn.execute(
@@ -1924,12 +1990,14 @@ def main():
     signal.signal(signal.SIGINT,  _handle_sigterm)
     atexit.register(cleanup_firewall)
 
-    _extra_v4 = [n for n in EXTRA_WHITELIST if n.version == 4]
-    _extra_v6 = [n for n in EXTRA_WHITELIST if n.version == 6]
-
-    # ★ 必须在 setup_firewall() 之前：非法配置若走到 nft 加载，报错只有
+    # ★ 必须先校验：EXTRA_WHITELIST 里若有非网段元素，下面的 n.version
+    #   会先抛 AttributeError，友好报错根本走不到。
+    # ★ 也必须在 setup_firewall() 之前：非法配置若走到 nft 加载，报错只有
     #   `/dev/stdin:38:69` 行号；而前缀冲突那类错误连报错都没有，是静默失效。
     _validate_config()
+
+    _extra_v4 = [n for n in EXTRA_WHITELIST if n.version == 4]
+    _extra_v6 = [n for n in EXTRA_WHITELIST if n.version == 6]
 
     _startup_selfcheck()
 
@@ -2008,16 +2076,20 @@ def main():
     # 启动时立即执行一次清理
     _maybe_cleanup_db()
 
+    open_fail_count = 0
     while not _shutdown_requested:
         proc = None
         try:
             proc = open_log_stream()
+            open_fail_count = 0          # 打开成功即视为日志源已恢复
             _consume_log_stream(proc)
             if not _shutdown_requested:
                 print("[!] 日志流已中断，5 秒后重连…", flush=True)
         except Exception as e:
+            open_fail_count += 1
             if not _shutdown_requested:
-                print(f"[!] 日志流异常: {e}，5 秒后重连…", flush=True)
+                print(f"[!] 日志流异常（连续 {open_fail_count} 次）: {e}，"
+                      f"5 秒后重连…", flush=True)
         finally:
             if proc is not None and proc.poll() is None:
                 try:
@@ -2033,6 +2105,11 @@ def main():
                 except Exception:
                     pass
         if not _shutdown_requested:
+            if open_fail_count >= 5:
+                # ★ 没有日志源 = 永远不会触发封禁。继续以 active 状态空转
+                #   只会掩盖故障；退出后由 systemd 的 Restart/启动限流暴露。
+                sys.exit("[!] 连续 5 次无法打开内核日志源，退出。"
+                         "请检查 journalctl / kern.log 后重启服务")
             _maybe_cleanup_db()
             _interruptible_sleep(5)
 
