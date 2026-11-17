@@ -206,10 +206,20 @@ EXTRA_WHITELIST = [
 # ============================================================
 #                      3. 行为配置区
 # ============================================================
-BAN_TIME   = 86400              # 封禁时长（秒）= 24 小时
+# 下面三项决定"这套配置跑成什么形态"，也是最常改、改错代价最大的三项
+# （同机两套实例撞前缀或撞表名会互相误封），所以提到最前面。
+# ★ DRY_RUN 影响所有封禁动作（端口扫描与 ICMP 一致）
+#   - DRY_RUN=True：只记事件不封禁（ICMP 的 ENABLE_ICMP_BAN 也会被压住）
+#   - DRY_RUN=False：按各自开关实际封禁
+DRY_RUN    = False
 
 PORT_SCAN_PREFIX  = "HOST_SCAN:"     # 端口扫描日志前缀（内核 nft log），容器与host需要区分，否则会同时封禁
 ICMP_PROBE_PREFIX = "HOST_ICMP:"    # ICMP 探测日志前缀，容器与host需要区分，否则会同时封禁
+
+# nft 表名（inet 族，与 Docker 的 ip/ip6 族隔离）
+NFT_TABLE = "port_scan_guard_host"
+
+BAN_TIME   = 86400              # 封禁时长（秒）= 24 小时
 
 # ---- ICMP echo-request（ping）策略 ----
 #   - 白名单 IP 的 ping 不记录（nft 层 return 直接放行）
@@ -230,11 +240,6 @@ ENABLE_ICMP_LOG = True
 # ★ 需 ENABLE_ICMP_LOG = True 才有意义（无日志就没有封禁触发点）。
 ENABLE_ICMP_BAN = False
 
-# ★ DRY_RUN 影响所有封禁动作（端口扫描与 ICMP 一致）
-#   - DRY_RUN=True：只记事件不封禁（ICMP 的 ENABLE_ICMP_BAN 也会被压住）
-#   - DRY_RUN=False：按各自开关实际封禁
-DRY_RUN    = False
-
 # 退出时是否删除整张 nft 表（包括已封禁 IP）。
 # False = 保留封禁记录，重启服务后继续生效（推荐）；
 # True  = 停服即全部解封，重启后从零开始。
@@ -246,15 +251,14 @@ DESTROY_TABLE_ON_EXIT = False
 #   代价只在真的装到那个数量时产生。所以这是"安全边界"而非日常水位。
 #   推满的内存：v4/v6 各 524288 → 98MB + 107MB ≈ 205MB（两侧统一取 2^19）。
 #
-# ★ 两侧都取 524288 是权衡结果，不是各自的最优值：
-#   - v4 原本 1048576（满表 196MB）。v4 没有聚合选项（聚合到 /24 会误封同
-#     C 段邻居），容量是唯一抗灌手段，所以从抗灌角度 1M 更好。但实际水位是
-#     几十到几百条，524288 仍有千倍以上余量；降一半只把"理论灌满时间"从
-#     ~2.9 小时缩短到 ~1.5 小时（按 100 封禁/s 上限估），而 size 不预分配，
-#     降它省不到任何日常内存 —— 纯粹是为了两侧数值统一。
-#   - v6 原本 262144（满表 54MB）。加容量的收益很低：v6 攻击者换源零成本
-#     （一个 /64 就有 2^64 个地址），灌满速度受**封禁速率**限制而非容量，
-#     翻倍只是把漏封起点往后推一倍。真正有效的做法是 V6_AGG_PREFIXLEN < 128。
+# ★ 两侧统一取 524288，是抗灌能力与内存估值之间的折中：
+#   - v4 没有聚合选项（聚合到 /24 会误封同 C 段邻居），容量是唯一抗灌手段。
+#     按 100 封禁/s 的上限估，524288 槽约 1.5 小时才灌满；而实际水位只有
+#     几十到几百条，离上限还有三个数量级余量。
+#   - v6 加容量收益很低：攻击者换源零成本（一个 /64 就有 2^64 个地址），
+#     灌满速度受**封禁速率**限制而非容量，继续翻倍只是把漏封起点往后推。
+#     真要抗 v6 换源扫描，有效手段是 V6_AGG_PREFIXLEN < 128。
+#   - 两侧取同值便于对账：横幅与 `nft list set` 两边的数字可直接比较。
 #   若内存紧张，正确方向是开启聚合 + 把 v6 降到 65536，而不是继续加容量。
 SET4_MAXELEM = 524288
 SET6_MAXELEM = 524288
@@ -286,44 +290,30 @@ SET6_MAXELEM = 524288
 #   只产生 1 个 `2001:db8:77::`。
 V6_AGG_PREFIXLEN = 128
 
-# nft 表名（inet 族，与 Docker 的 ip/ip6 族隔离）
-NFT_TABLE = "port_scan_guard_host"
-
 # PREROUTING 链优先级：
 #   -110 = dstnat(-100) - 10，比 Docker 的 DNAT 更早执行
-#   用纯数字，避免旧版 nft 不识别 "dstnat - 10" 表达式
+#   用纯数字而不是 `dstnat - 10` 表达式：后者依赖 nft 的常数运算支持，
+#   直接写 -110 在所有版本上都能解析
 #   改成 filter 优先级（-10 或 0）会在 DNAT 之后，拦不到映射端口
 NFT_PREROUTING_PRIORITY = -110
 
-# ---- 日志限速（仅在 USE_LOG_QUOTA = False 时生效）----
-# ★ 注意：nft 中 limit 是匹配表达式，超速即"不匹配"并中断当前规则。
-#   因此本脚本把 log 和 drop 拆成两条规则：
+# ---- 日志限速：per-IP 配额 ----
+# ★ nft 中 limit 是匹配表达式，超速即"不匹配"并中断当前规则，因此本脚本
+#   把 log 和 drop 拆成两条规则：
 #     - log 规则受 limit 限速（超速包不写日志）
 #     - drop 规则无条件执行（不受 limit 影响，保证安全）
-# ★ 已知缺陷：limit 是"每条规则一个桶、所有源 IP 共享"，一个 IP 打满
-#   5/s 就会让其他 IP 的扫描不写日志 → 不进黑名单（这些包仍被 drop，
-#   只是没有 24h 持久封禁）。这正是下面 USE_LOG_QUOTA 要解决的问题；
-#   只有在 per-IP 配额不可用（nft 过旧）时才需要退回本模式。
-# 关闭后日志量等于命中次数，仅在调试或低流量环境使用
-USE_HASHLIMIT    = True
-HASHLIMIT_RATE   = "5/sec"
-HASHLIMIT_BURST  = 10
-
-# ---- per-IP 日志配额（USE_LOG_QUOTA = True 时取代上面的全局限速）----
-# 背景：nft 的 limit 是"每条规则一个令牌桶，所有来源共享"，不按源 IP 分。
-#   一个 IP 打满 5/s 就能让其他来源的扫描完全不写日志 → 不进黑名单，
-#   等于被单点噪音"致盲"。启用本项后每个源 IP 持有自己的令牌桶，
+# 背景：nft 的 limit 是"每条规则一个令牌桶、所有来源共享"，不按源 IP 分。
+#   一个 IP 就能把桶打满，让其他来源的扫描完全不写日志 → 不进黑名单，
+#   等于被单点噪音"致盲"。per-IP 配额让每个源 IP 持有自己的令牌桶，
 #   谁也挤不掉谁；只要有一个包被记录，该 IP 就会被封 24h。
 #
-# ★ 配额不必给大：封禁只需要 1 条日志。设成 1/second 反而比全局 5/s
-#   更省日志——单个 IP 首秒最多留 2 条（burst），之后稳态 1 条/秒，
-#   而不是 5 条。实测：连发 6 包只记 2 条，此后每秒 1 包连续 8 秒全部记上。
-# ★ 依赖 nft 的 dynamic set + update 语句（nft >= 0.9，本项目要求
-#   >= 1.0.6）。若目标机 nft 报 update 语法错误，把本项设为 False
-#   即回到"全局限速"的旧行为。
+# ★ 配额不必给大：封禁只需要 1 条日志。设成 1/second 反而更省日志——
+#   单个 IP 首秒最多留 2 条（burst），之后稳态 1 条/秒。
+#   实测：连发 6 包只记 2 条，此后每秒 1 包连续 8 秒全部记上。
+# ★ 依赖 nft 的 dynamic set + update 语句（要求 >= 1.0.6，1.0.9 已实测）。
+#   nft < 1.0.6 不支持这条路径，加载时会直接报 update 语法错误。
 # ★ 单开 per-IP 配额会把总日志上限放大成"N 个 IP × 配额"，
 #   被海量 IP 扫描时照样能刷爆内核日志 → 必须保留下面的每规则兜底。
-USE_LOG_QUOTA      = True
 LOG_QUOTA_RATE     = "1/second"    # 每个源 IP 的日志配额
 LOG_QUOTA_BURST    = 2
 LOG_QUOTA_TIMEOUT  = "60s"         # 元素空闲多久释放（update 会刷新）
@@ -333,8 +323,7 @@ LOG_QUOTA_TIMEOUT  = "60s"         # 元素空闲多久释放（update 会刷新
 #   4 条扫描规则（TCP SYN / FIN / NULL + UDP；开 ICMP 封禁时再各 +1）。
 #   稳态元素数上限 ≈ 规则数 × 100/s × LOG_QUOTA_TIMEOUT(60s)
 #                    = 4 × 100 × 60 ≈ 24000（开 ICMP 封禁约 30000）。
-#   因此 v6 侧原本的 16384 在这种极端情况下会被填满（填满即漏封），
-#   已与 v4 对齐到 65536，留 2 倍以上余量。
+#   因此两侧都取 65536：对上述上限留 2 倍以上余量。
 # ★ 默认 V6_AGG_PREFIXLEN = 128（逐地址）时按"地址数"算；若改成按 /64
 #   聚合，一个元素代表一整个前缀，元素数成数量级下降，容量更宽松。
 # ★ set 满后的行为**不是"跳过配额、继续 log"**（实测，nft 1.0.9）：
@@ -350,9 +339,8 @@ LOG_QUOTA_TIMEOUT  = "60s"         # 元素空闲多久释放（update 会刷新
 LOG_QUOTA_SET4_MAXELEM = 65536
 LOG_QUOTA_SET6_MAXELEM = 65536
 
-# 每条 log 规则的总量兜底（仅 USE_LOG_QUOTA = True 时生效）：在 per-IP 配额
-# 之上再压一道**不区分来源 IP** 的上限，防止"大量 IP 各刷自己的配额"
-# 把内核日志打爆。
+# 每条 log 规则的总量兜底：在 per-IP 配额之上再压一道**不区分来源 IP** 的
+# 上限，防止"大量 IP 各刷自己的配额"把内核日志打爆。
 # ★ nft 的 limit 是每规则一个桶，所以实际天花板是「规则条数 × 本值」
 #   （默认启用的检测项共 10 条 log 规则：TCP SYN / FIN / NULL 与 UDP 各
 #   v4+v6、ICMP v4+v6，各一个桶），不是整机 100/s。关掉 ENABLE_FLAG_SCAN
@@ -442,10 +430,6 @@ ICMP_PROBE_RE = re.compile(
     r"(?:.*?\bTYPE=(?P<type>\d+))?"
 )
 
-# 兼容别名
-LOG_RE = PORT_SCAN_RE
-LOG_PREFIX = PORT_SCAN_PREFIX
-
 _searcher_v4 = None
 _searcher_v6 = None
 _db_conn     = None
@@ -460,7 +444,6 @@ _online_fail_until = 0.0        # 在线查询熔断截止时间（time.time 基
 _firewall_setup_done = False
 
 _shutdown_requested = False
-_current_proc       = None
 
 _last_cleanup_ts    = 0.0
 _table_lost_warned_ts = 0.0
@@ -513,8 +496,8 @@ def _nft_table_exists():
 def _expires_to_seconds(exp):
     """把 nft JSON 的 expires 统一转成"剩余秒数"，无法判断时返回 None。
 
-    ★ nft >= 0.9 的 JSON 输出单位是**秒**（实测 1.0.9：120s 元素过 3 秒后
-      为 116，文本形式同时显示 expires 1m56s952ms），极老版本才是毫秒。
+    ★ nft 的 JSON 输出单位是**秒**（实测 1.0.9：120s 元素过 3 秒后为 116，
+      文本形式同时显示 expires 1m56s952ms），个别版本给的是毫秒。
       这里以"剩余时间不可能超过 max(BAN_TIME*2, 7 天)"作为判据区分两者。
     """
     if exp is None:
@@ -571,7 +554,7 @@ def _extract_set_elements(set_name):
 
 
 def _nft_rate(rate_str):
-    """'5/sec' / '5/s' → '5/second'（旧版 nft 不认缩写）"""
+    """'100/s' / '100/sec' → '100/second'（nft 只认 second/minute/hour 全称）"""
     s = rate_str.strip()
     if s.endswith("/second"):
         return s
@@ -585,8 +568,17 @@ def _nft_rate(rate_str):
 # ---------------- 配置校验 ----------------
 
 _NFT_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
-_RATE_RE     = re.compile(r"^\d+/(?:second|sec|s|minute|hour)$")
-_TIMEOUT_RE  = re.compile(r"^\d+(?:ms|s|m|h|d)$")    # 必须带单位，实测 "timeout 60" 语法错
+# ★ 首位限定非零：rate 0 与 timeout 0 都能通过朴素的 "^\d+" 正则，但
+#   - `limit rate 0/second` 实测 nft 报 "Could not process rule: Invalid
+#     argument"，整份配置加载失败，服务起不来（这个是响的，容易发现）；
+#   - `timeout 0s` 语法合法、nft 也接受，实测含义是**无超时**：`nft list
+#     set` 里根本不会出现 timeout 行，元素也永远没有 expires（对照
+#     `timeout 60s` 会显示 `expires 59s997ms`）。于是配额 set 只增不减，
+#     长时间被海量 IP 扫描后填满 65536，满后 update 失败会中断整条 log
+#     规则 → 该族新源完全不写日志、不进黑名单，而且启动无任何报错。
+#   两者都是改配置时容易手滑写出的值，必须在启动前拦掉。
+_RATE_RE     = re.compile(r"^0*[1-9]\d*/(?:second|sec|s|minute|hour)$")
+_TIMEOUT_RE  = re.compile(r"^0*[1-9]\d*(?:ms|s|m|h|d)$")    # 必须带单位，实测 "timeout 60" 语法错
 
 # nft 的 log prefix 上限是 127 字节（含结尾 NUL），实测 127 报
 # "log prefix is too long"、126 通过。留 6 字节余量给"前缀 + 空格"。
@@ -646,38 +638,35 @@ def _validate_config():
                 errs.append(f"{name} 含非法端口 {p!r}（应为 1~65535 的整数）")
 
     # ---- 速率 / 超时 ----
-    if USE_LOG_QUOTA:
-        if not _RATE_RE.match(str(LOG_QUOTA_RATE).strip()):
-            errs.append(f"LOG_QUOTA_RATE={LOG_QUOTA_RATE!r} 格式应为 "
-                        f"'1/second' 这类「数字/单位」")
-        if not _RATE_RE.match(str(LOG_GLOBAL_RATE).strip()):
-            errs.append(f"LOG_GLOBAL_RATE={LOG_GLOBAL_RATE!r} 格式应为 "
-                        f"'100/second' 这类「数字/单位」")
-        for name, v in (("LOG_QUOTA_BURST", LOG_QUOTA_BURST),
-                        ("LOG_GLOBAL_BURST", LOG_GLOBAL_BURST)):
-            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
-                errs.append(f"{name}={v!r} 必须是 >= 1 的整数")
-        if not _TIMEOUT_RE.match(str(LOG_QUOTA_TIMEOUT).strip()):
-            errs.append(f"LOG_QUOTA_TIMEOUT={LOG_QUOTA_TIMEOUT!r} 缺单位："
-                        f"nft 要求 '60s'、'10m' 这类写法，写 60 会语法错误")
-        # ★ size 非法时 nft 的报错会错位：`size 0` 实测报的是后面那行的
-        #   "unexpected '}'"，根本看不出是 size 写错了，所以必须前置校验。
-        for name, v in (("LOG_QUOTA_SET4_MAXELEM", LOG_QUOTA_SET4_MAXELEM),
-                        ("LOG_QUOTA_SET6_MAXELEM", LOG_QUOTA_SET6_MAXELEM)):
-            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
-                errs.append(f"{name}={v!r} 必须是 >= 1 的整数"
-                            f"（nft 的 size 写 0/负数只会报一条指向别处的"
-                            f"语法错，很难定位）")
-    elif USE_HASHLIMIT:
-        if not _RATE_RE.match(str(HASHLIMIT_RATE).strip()):
-            errs.append(f"HASHLIMIT_RATE={HASHLIMIT_RATE!r} 格式应为 "
-                        f"'5/second' 这类「数字/单位」")
-        if not isinstance(HASHLIMIT_BURST, int) or HASHLIMIT_BURST < 1:
-            errs.append(f"HASHLIMIT_BURST={HASHLIMIT_BURST!r} 必须是 >= 1 的整数")
+    if not _RATE_RE.match(str(LOG_QUOTA_RATE).strip()):
+        errs.append(f"LOG_QUOTA_RATE={LOG_QUOTA_RATE!r} 格式应为 "
+                    f"'1/second' 这类「数字/单位」，且数字必须 >= 1"
+                    f"（rate 0 会被 nft 拒绝，整份配置加载失败）")
+    if not _RATE_RE.match(str(LOG_GLOBAL_RATE).strip()):
+        errs.append(f"LOG_GLOBAL_RATE={LOG_GLOBAL_RATE!r} 格式应为 "
+                    f"'100/second' 这类「数字/单位」，且数字必须 >= 1"
+                    f"（rate 0 会被 nft 拒绝，整份配置加载失败）")
+    for name, v in (("LOG_QUOTA_BURST", LOG_QUOTA_BURST),
+                    ("LOG_GLOBAL_BURST", LOG_GLOBAL_BURST)):
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            errs.append(f"{name}={v!r} 必须是 >= 1 的整数")
+    if not _TIMEOUT_RE.match(str(LOG_QUOTA_TIMEOUT).strip()):
+        errs.append(f"LOG_QUOTA_TIMEOUT={LOG_QUOTA_TIMEOUT!r} 必须带单位且"
+                    f"数值 >= 1：nft 要求 '60s'、'10m' 这类写法，写 60 会"
+                    f"语法错误；写 0s 更隐蔽——实测含义是「无超时」，"
+                    f"元素永不释放，配额 set 只增不减，满了该族新源就不再"
+                    f"写日志、不进黑名单，且启动无任何报错")
+    # ★ size 非法时 nft 的报错会错位：`size 0` 实测报的是后面那行的
+    #   "unexpected '}'"，根本看不出是 size 写错了，所以必须前置校验。
+    for name, v in (("LOG_QUOTA_SET4_MAXELEM", LOG_QUOTA_SET4_MAXELEM),
+                    ("LOG_QUOTA_SET6_MAXELEM", LOG_QUOTA_SET6_MAXELEM)):
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            errs.append(f"{name}={v!r} 必须是 >= 1 的整数"
+                        f"（nft 的 size 写 0/负数只会报一条指向别处的"
+                        f"语法错，很难定位）")
 
     # ---- 黑名单 set 容量 ----
-    # ★ 与 USE_LOG_QUOTA 无关：bl4/bl6 是无条件生成的黑名单 set，任何模式下
-    #   都会用到这两个值，所以放在 if 分支外面校验。
+    # ★ 黑名单 set 与日志配额是两套 set，这里的容量只影响 bl4/bl6。
     # ★ 同 size 的坑：写 0 时 nft 报的是后面那行的 "unexpected '}'"。
     for name, v in (("SET4_MAXELEM", SET4_MAXELEM),
                     ("SET6_MAXELEM", SET6_MAXELEM)):
@@ -701,6 +690,24 @@ def _validate_config():
             or not (32 <= V6_AGG_PREFIXLEN <= 128):
         errs.append(f"V6_AGG_PREFIXLEN={V6_AGG_PREFIXLEN!r} 必须是 32~128 的"
                     f"整数（128 = 逐地址，默认；64 = 按 /64 聚合）")
+
+    # ---- PREROUTING 优先级 ----
+    # ★ 必须是整数：本项目按纯数字生成 `priority -110;`，写成表达式或字符串
+    #   会让 nft 报语法错、整表加载失败。
+    # ★ 但更要紧的是「写对了却写晚了」：0 或正数（filter 优先级）在 Docker
+    #   DNAT(-100) 之后，此时 dport 已被改写成容器内端口，清单里的宿主机端口
+    #   一个都匹配不到 —— nft 不报任何错，只是防护静默失效。这类取值无法
+    #   判断是否有意（非 Docker 环境 -10 也合理），所以只告警不退出。
+    if not isinstance(NFT_PREROUTING_PRIORITY, int) \
+            or isinstance(NFT_PREROUTING_PRIORITY, bool):
+        errs.append(f"NFT_PREROUTING_PRIORITY={NFT_PREROUTING_PRIORITY!r} "
+                    f"必须是整数（默认 -110）。本项目生成的是 "
+                    f"`priority -110;`，字符串或表达式会直接语法错误")
+    elif NFT_PREROUTING_PRIORITY > -100:
+        print(f"[!] NFT_PREROUTING_PRIORITY={NFT_PREROUTING_PRIORITY} 晚于 "
+              f"Docker DNAT(-100)：Docker 映射端口的 dport 已被改写，"
+              f"清单里的宿主机端口可能匹配不到（无 Docker 时无影响）",
+              flush=True)
 
     # ---- 开关组合 ----
     # ★ ENABLE_ICMP_BAN=True + ENABLE_ICMP_LOG=False 只告警不退出：
@@ -730,18 +737,12 @@ def _build_nft_config():
 
     # 日志语句。★ 只用于独立的 log 规则，不能和 drop 写在一起
     #   （limit 失败会连 drop 一起跳过）。
-    # 两种模式：
-    #   1) USE_LOG_QUOTA=True ：[per-IP 配额] + [每规则兜底] + log
-    #      每条规则要按 v4/v6 各生成一条（见 _emit_log_rule）
-    #   2) USE_LOG_QUOTA=False：沿用旧的"全局 limit + log"，一条规则通吃两族
+    #   形状固定为 [每规则兜底 limit] + [per-IP 配额 update] + log，
+    #   且每条规则要按 v4/v6 各生成一条（见 _emit_log_rule）。
     def _limit_stmt(rate_str, burst):
-        """'5/sec' → 'limit rate 5/second burst N packets '"""
+        """'100/s' → 'limit rate 100/second burst N packets '"""
         return (f"limit rate {_nft_rate(rate_str)} "
                 f"burst {burst} packets ")
-
-    # 旧模式下的限速前缀（不区分来源 IP）
-    old_limit = _limit_stmt(HASHLIMIT_RATE, HASHLIMIT_BURST) \
-        if USE_HASHLIMIT else ""
 
     # ★ inet 族里 `ip saddr` 对 IPv6 包不成立，因此 per-IP 配额必须
     #   按协议族拆成两条规则；不拆的话 IPv6 流量完全没有配额。
@@ -760,67 +761,66 @@ def _build_nft_config():
 
     # ---- 黑名单 set（IPv4）----
     L.append(f"    set {NFT_TABLE}_bl4 {{")
-    L.append(f"        type ipv4_addr")
-    L.append(f"        flags timeout")
+    L.append("        type ipv4_addr")
+    L.append("        flags timeout")
     L.append(f"        timeout {BAN_TIME}s")
     L.append(f"        size {SET4_MAXELEM}")
-    L.append(f"    }}")
+    L.append("    }")
 
     # ---- 黑名单 set（IPv6）----
     L.append(f"    set {NFT_TABLE}_bl6 {{")
-    L.append(f"        type ipv6_addr")
-    L.append(f"        flags timeout")
+    L.append("        type ipv6_addr")
+    L.append("        flags timeout")
     L.append(f"        timeout {BAN_TIME}s")
     L.append(f"        size {SET6_MAXELEM}")
-    L.append(f"    }}")
+    L.append("    }")
 
     # ---- 日志配额 set（per-IP 令牌桶）----
     #   flags dynamic：允许从包路径 update（必须）
     #   flags timeout：元素空闲 timeout 后自动释放，避免被扫描时无限增长
-    if USE_LOG_QUOTA:
-        for _fam, _cond, _sname, _key in FAMILIES:
-            _type = "ipv4_addr" if _fam == "ip" else "ipv6_addr"
-            _size = (LOG_QUOTA_SET4_MAXELEM if _fam == "ip"
-                     else LOG_QUOTA_SET6_MAXELEM)
-            L.append(f"    set {_sname} {{")
-            L.append(f"        type {_type}")
-            L.append(f"        size {_size}")
-            L.append(f"        flags dynamic,timeout")
-            L.append(f"        timeout {LOG_QUOTA_TIMEOUT}")
-            L.append(f"    }}")
+    for _fam, _cond, _sname, _key in FAMILIES:
+        _type = "ipv4_addr" if _fam == "ip" else "ipv6_addr"
+        _size = (LOG_QUOTA_SET4_MAXELEM if _fam == "ip"
+                 else LOG_QUOTA_SET6_MAXELEM)
+        L.append(f"    set {_sname} {{")
+        L.append(f"        type {_type}")
+        L.append(f"        size {_size}")
+        L.append("        flags dynamic,timeout")
+        L.append(f"        timeout {LOG_QUOTA_TIMEOUT}")
+        L.append("    }")
 
     # ---- 端口 set ----
     if tcp_ports:
         L.append(f"    set {NFT_TABLE}_tcp {{")
-        L.append(f"        type inet_service")
+        L.append("        type inet_service")
         L.append(f"        elements = {{ {', '.join(map(str, tcp_ports))} }}")
-        L.append(f"    }}")
+        L.append("    }")
 
     if udp_ports:
         L.append(f"    set {NFT_TABLE}_udp {{")
-        L.append(f"        type inet_service")
+        L.append("        type inet_service")
         L.append(f"        elements = {{ {', '.join(map(str, udp_ports))} }}")
-        L.append(f"    }}")
+        L.append("    }")
 
     # ---- 白名单 set ----
     if wl4:
         elems = ", ".join(str(n) for n in wl4)
         L.append(f"    set {NFT_TABLE}_wl4 {{")
-        L.append(f"        type ipv4_addr")
-        L.append(f"        flags interval")
+        L.append("        type ipv4_addr")
+        L.append("        flags interval")
         L.append(f"        elements = {{ {elems} }}")
-        L.append(f"    }}")
+        L.append("    }")
 
     if wl6:
         elems = ", ".join(str(n) for n in wl6)
         L.append(f"    set {NFT_TABLE}_wl6 {{")
-        L.append(f"        type ipv6_addr")
-        L.append(f"        flags interval")
+        L.append("        type ipv6_addr")
+        L.append("        flags interval")
         L.append(f"        elements = {{ {elems} }}")
-        L.append(f"    }}")
+        L.append("    }")
 
     # ---- PREROUTING 链（在 Docker DNAT 之前）----
-    L.append(f"    chain prerouting {{")
+    L.append("    chain prerouting {")
     L.append(f"        type filter hook prerouting "
              f"priority {NFT_PREROUTING_PRIORITY}; policy accept;")
 
@@ -841,9 +841,8 @@ def _build_nft_config():
           开启 ICMP 封禁后该绕过不成立（第一个 ping 就被封），此时占配额。
 
         ★ `meta nfproto ipv4` / `ipv6` 在 `nft list` 输出里**会正常显示**
-          （nft 1.0.9 实测），两条规则一眼就能看出族不同。若在更旧的版本上
-          看不到这段、只看到 `lq4` / `lq6` 不同，也不用担心条件丢了——删掉
-          任一条都会让对应协议族失去配额。
+          （nft 1.0.9 实测），两条规则一眼就能看出族不同。族区分同时体现在
+          set 名（`lq4` / `lq6`）上，删掉任一条都会让对应协议族失去配额。
 
         ★★ 兜底 limit 必须排在 update **之前**（实测 nft 1.0.9）：
           - 若写成 `update @set {...} limit 100/second log`，被兜底丢掉的包
@@ -857,16 +856,12 @@ def _build_nft_config():
             扫描规则（TCP SYN/FIN/NULL + UDP），稳态元素数上限
             ≈ 4 × 100/s × LOG_QUOTA_TIMEOUT(60s) ≈ 24000，对 65536 的容量
             有 2 倍以上余量，正常运行不会被填满。
-          - 实测前置顺序合法，且 per-IP 配额行为不变：兜底 5/s burst 5 前置，
-            连发 20 包，per-IP 仍只放行 burst 2 个，元素正常创建、timeout
-            正常刷新。
+          - 实测前置顺序合法，且 per-IP 配额行为不变：连发 20 包，per-IP
+            仍只放行 burst 2 个，元素正常创建、timeout 正常刷新。
           - 代价：超兜底限速的包不再创建元素，因此"此刻超速、稍后恢复"的
             源不会被补记。这符合预期——超速意味着总量已过载，该丢就丢。
         """
         tail = f"log prefix \"{prefix} \" level {level}"
-        if not USE_LOG_QUOTA:
-            L.append(f"        {match} {old_limit}{tail}")
-            return
         glob = _limit_stmt(LOG_GLOBAL_RATE, LOG_GLOBAL_BURST)
         if not quota:
             # 不占配额时无需分族：调用方的 match 已自带 icmp / icmpv6 关键字
@@ -966,8 +961,8 @@ def _build_nft_config():
         if final_verdict:
             L.append(f"        udp dport @{NFT_TABLE}_udp {final_verdict}")
 
-    L.append(f"    }}")
-    L.append(f"}}")
+    L.append("    }")
+    L.append("}")
 
     return "\n".join(L) + "\n"
 
@@ -1030,7 +1025,7 @@ def setup_firewall():
 
     # 恢复封禁记录：按剩余时间恢复，避免重启后封禁被无限续期。
     # ★ 剩余秒数已由 _extract_set_elements() 归一化，这里直接用。
-    # ★ 拼成一个 nft -f 批量加载：上千条封禁时避免上千次 fork。
+    # ★ 按批拼成 nft -f 脚本加载：上千条封禁时避免上千次 fork。
     def _restore(pairs):
         lines = []
         for setname, items in pairs:
@@ -1041,7 +1036,7 @@ def setup_firewall():
                     continue
                 if t > BAN_TIME:
                     t = BAN_TIME
-                # ★ 从旧版本升级时，旧 bl6 里可能是当时粒度下的完整地址；
+                # ★ 库里存的是封禁时的原始地址，未必已是归一后的前缀；
                 #   新表的匹配若带掩码（V6_AGG_PREFIXLEN < 128），必须归一后
                 #   再写，否则这些元素躺在表里但永远匹配不到 —— 封禁静默
                 #   失效且不报错。默认 128 时归一等于原样，走同一路径无害。
@@ -1410,6 +1405,14 @@ def _cache_put(ip: str, info: dict):
         cutoff = time.time() - IP_INFO_CACHE_TTL
         for k in [k for k, v in _ip_info_cache.items() if v[0] < cutoff]:
             _ip_info_cache.pop(k, None)
+        # ★ 若所有条目都还在 TTL 内，上面一条也删不掉：分布式扫描可在
+        #   TTL 窗口内制造远超上限的新 IP，缓存会一直涨。这里按写入时间
+        #   丢掉最旧的部分，保证有硬上限（丢掉只是下次重新查询，无副作用）。
+        extra = len(_ip_info_cache) - IP_INFO_CACHE_MAX
+        if extra > 0:
+            for k, _ in sorted(_ip_info_cache.items(),
+                               key=lambda kv: kv[1][0])[:extra]:
+                _ip_info_cache.pop(k, None)
 
 
 def get_ip_info(ip: str) -> dict:
@@ -1508,7 +1511,7 @@ def _v6_net_key(addr) -> str:
 
     ★ 聚合时（V6_AGG_PREFIXLEN < 128）必须归一才能写进 set：nft 侧匹配
       写成 `ip6 saddr & <mask> @bl6`，查询时先用掩码处理包的源地址再查表。
-      若表里存的是未归一的完整地址（例如改过一次粒度后留下的旧元素），
+      若表里存的是未归一的完整地址（粒度切换后残留的元素即属此类），
       掩码后永远查不到 —— 封禁记录在表里躺着，流量却照过，且不报任何错。
 
     V6_AGG_PREFIXLEN=128（默认）时返回原地址，等价于不聚合。
@@ -1738,7 +1741,6 @@ def _interruptible_sleep(seconds):
 
 def _dispatch_log_line(line: str):
     """处理单行日志：分流到端口扫描 / ICMP 记录。"""
-    # ---- 端口扫描日志 ----
     # ---- ICMP 探测日志（先判断：避免 PORT_SCAN_PREFIX 是它的子串时误走扫描分支）----
     if ENABLE_ICMP_LOG and ICMP_PROBE_PREFIX in line:
         m = ICMP_PROBE_RE.search(line)
@@ -1911,7 +1913,7 @@ def _startup_selfcheck():
 
 
 def main():
-    global _extra_v4, _extra_v6, _current_proc
+    global _extra_v4, _extra_v6
 
     if os.geteuid() != 0:
         sys.exit("请以 root 权限运行")
@@ -1969,8 +1971,8 @@ def main():
         print(f"[*] ICMP：记录并封禁非白名单 echo-request"
               f"（封 {BAN_TIME}s，占用 per-IP 配额）", flush=True)
     elif ENABLE_ICMP_BAN and DRY_RUN:
-        print(f"[!] ICMP：DRY_RUN 压住了封禁，只记录不封禁"
-              f"（不占 per-IP 配额，避免挤掉端口扫描日志）", flush=True)
+        print("[!] ICMP：DRY_RUN 压住了封禁，只记录不封禁"
+              "（不占 per-IP 配额，避免挤掉端口扫描日志）", flush=True)
     else:
         print("[*] ICMP：只记录非白名单 echo-request，不封禁、不丢包"
               "（不占 per-IP 配额）", flush=True)
@@ -1989,22 +1991,14 @@ def main():
               flush=True)
     else:
         print("[*] DRY_RUN = False：按各开关实际封禁", flush=True)
-    if USE_LOG_QUOTA:
-        print(f"[*] 日志配额: 每源 IP {LOG_QUOTA_RATE} / burst "
-              f"{LOG_QUOTA_BURST}；每规则兜底 {LOG_GLOBAL_RATE}"
-              f"（仅影响 log，不影响 drop）", flush=True)
-        # 配额 set 是每族一个（v4/v6 各一个，族内各规则共用），满了之后
-        # 该族新源一律不写日志——比黑名单满更隐蔽，值得单独打出来。
-        print(f"[*] 配额 set 容量：IPv4 {LOG_QUOTA_SET4_MAXELEM} / "
-              f"IPv6 {LOG_QUOTA_SET6_MAXELEM} 条/族"
-              f"（满了该族新源不再写日志）", flush=True)
-    elif USE_HASHLIMIT:
-        print(f"[!] 日志限速: {HASHLIMIT_RATE} / burst {HASHLIMIT_BURST}"
-              f"，不区分来源 IP：单个 IP 打满即让其他来源不写日志",
-              flush=True)
-    else:
-        print("[!] 日志限速已关闭：命中即 log，被攻击时可能刷爆内核日志",
-              flush=True)
+    print(f"[*] 日志配额: 每源 IP {LOG_QUOTA_RATE} / burst "
+          f"{LOG_QUOTA_BURST}；每规则兜底 {LOG_GLOBAL_RATE}"
+          f"（仅影响 log，不影响 drop）", flush=True)
+    # 配额 set 是每族一个（v4/v6 各一个，族内各规则共用），满了之后
+    # 该族新源一律不写日志——比黑名单满更隐蔽，值得单独打出来。
+    print(f"[*] 配额 set 容量：IPv4 {LOG_QUOTA_SET4_MAXELEM} / "
+          f"IPv6 {LOG_QUOTA_SET6_MAXELEM} 条/族"
+          f"（满了该族新源不再写日志）", flush=True)
     if UDP_PORTS and UDP_NEW_CONN_ONLY:
         print("[*] UDP 日志仅对 ct state new 生效（依赖 nf_conntrack）",
               flush=True)
@@ -2018,7 +2012,6 @@ def main():
         proc = None
         try:
             proc = open_log_stream()
-            _current_proc = proc
             _consume_log_stream(proc)
             if not _shutdown_requested:
                 print("[!] 日志流已中断，5 秒后重连…", flush=True)
@@ -2026,7 +2019,6 @@ def main():
             if not _shutdown_requested:
                 print(f"[!] 日志流异常: {e}，5 秒后重连…", flush=True)
         finally:
-            _current_proc = None
             if proc is not None and proc.poll() is None:
                 try:
                     proc.terminate()

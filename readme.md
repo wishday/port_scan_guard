@@ -70,7 +70,7 @@
 nft --version
 ```
 
-要求 **≥ 1.0.6**（1.0.9 已实测）。per-IP 日志配额依赖 dynamic set 与 `update @set { ... limit ... }`；版本过旧会加载失败，把 `USE_LOG_QUOTA` 设为 `False` 即可回到全局限速。未安装：
+要求 **≥ 1.0.6**（1.0.9 已实测）。per-IP 日志配额依赖 dynamic set 与 `update @set { ... limit ... }`；低于该版本会加载失败，须先升级 nftables。未安装：
 
 ```bash
 sudo apt update && sudo apt install -y nftables
@@ -300,7 +300,7 @@ IPv6 的封禁与日志配额按这个前缀长度聚合：`128` 表示**逐地�
 
 > 允许范围是 `32`–`128`，超出会被配置校验拦下：比 `/32` 更粗的前缀在防护上没有意义，只会把海量无关地址并进同一个封禁槽位。
 
-> **从聚合版切回 `128` 时**：set 里原有的元素是归一后的前缀地址（如 `2001:db8:77::`），改回逐地址后只有"源地址恰好等于该网络地址"的包才会命中，等于失效。启动恢复逻辑（`_restore()`）无法反推出原来的主机地址——那段信息在归一时就已经丢了。影响有限：最多 `BAN_TIME`（24 小时）后自然清空，期间这些来源只是失去"全端口封禁"，监测端口仍由独立的 drop 规则拦截。想立刻清干净就 `nft flush set inet <表名> <表名>_bl6`。
+> **把 `V6_AGG_PREFIXLEN` 从聚合值调回 `128` 时**：set 里原有的元素是归一后的前缀地址（如 `2001:db8:77::`），逐地址匹配下只有"源地址恰好等于该网络地址"的包才会命中，等于失效。启动恢复逻辑（`_restore()`）无法反推出原来的主机地址——那段信息在归一时就已经丢了。影响有限：最多 `BAN_TIME`（24 小时）后自然清空，期间这些来源只是失去"全端口封禁"，监测端口仍由独立的 drop 规则拦截。想立刻清干净就 `nft flush set inet <表名> <表名>_bl6`。
 
 **`SET4_MAXELEM` / `SET6_MAXELEM`（黑名单容量）**
 
@@ -330,32 +330,28 @@ IPv6 的封禁与日志配额按这个前缀长度聚合：`128` 表示**逐地�
 
 **ICMP 封禁会误伤吗**：会。正常运维的连通性探测（监控 ping、拨测）每次都是新的源，命中即封 24 小时，且封的是该 IP 的**全部**端口。建议先开记录模式跑一段时间，用[第十二节](#十二数据库查询速查)的 SQL 看看 ping 来源都是谁，再决定是否开 `ENABLE_ICMP_BAN`；确实要开就把监控探针加进 `EXTRA_WHITELIST`。
 
-**ICMP 与 per-IP 配额的关系**：只有在"真会封禁"（`ENABLE_ICMP_BAN=True` 且 `DRY_RUN=False`）时 ICMP 规则才**占**配额，其余情况**不占**。模式差异的原因见 [`USE_LOG_QUOTA`](#62-必须确认的配置项) 一节的说明。开启封禁后有个副作用要知道：同一 IP 的 ping 与端口扫描共用一个配额桶，**ping 之后 1 秒内的扫描可能进不了日志**——但那一刻 ping 已经触发封禁，拦截效果不受影响。
+**ICMP 与 per-IP 配额的关系**：只有在"真会封禁"（`ENABLE_ICMP_BAN=True` 且 `DRY_RUN=False`）时 ICMP 规则才**占**配额，其余情况**不占**。模式差异的原因见[日志配额](#62-必须确认的配置项)一节的说明。开启封禁后有个副作用要知道：同一 IP 的 ping 与端口扫描共用一个配额桶，**ping 之后 1 秒内的扫描可能进不了日志**——但那一刻 ping 已经触发封禁，拦截效果不受影响。
 
 **`ENABLE_FLAG_SCAN`**
 
 默认 `True`：除纯 SYN 扫描外，额外检测 **FIN / XMAS 扫描**（`tcp flags fin`）与**NULL 扫描**（六个标志位全为 0）。两条规则都要求 `ct state invalid,untracked`，因此正常连接关闭时的 FIN 不会被误判；依赖 `nf_conntrack`。设为 `False` 则只保留 SYN 规则。ACK 扫描（`-sA`）不在覆盖范围内，原因见[第一节](#一功能与边界)。
 
-**`USE_LOG_QUOTA` / 日志配额（决定"能不能封得住"）**
+**日志配额（决定"能不能封得住"）**
 
-默认 `True`：**每个源 IP 一个令牌桶**（`LOG_QUOTA_RATE = "1/second"`、`burst 2`），谁也不能把别人的日志配额挤掉。
+**每个源 IP 一个令牌桶**（`LOG_QUOTA_RATE = "1/second"`、`burst 2`），谁也不能把别人的日志配额挤掉。
 
-为什么需要它：nft 的 `limit` 默认是"每条规则一个桶、所有来源共享"。一个 IP 打满 5/s，其他来源的扫描就完全不写日志 → 不进黑名单。分布式扫描（100 个 IP 各扫一次）会只剩前几个被记录，等于被噪音致盲。
+为什么需要它：nft 的 `limit` 默认是"每条规则一个桶、所有来源共享"。一个 IP 就能把桶打满，其他来源的扫描就完全不写日志 → 不进黑名单。分布式扫描（100 个 IP 各扫一次）会只剩前几个被记录，等于被噪音致盲。
 
-配额给小会不会漏封？**不会**。封禁只需要**一条**日志，burst 2 足够触发；反而比全局限速更省日志（单 IP 首秒最多 2 条，之后稳态 1 条/秒，而不是 5 条/秒）。
+配额给小会不会漏封？**不会**。封禁只需要**一条**日志，burst 2 足够触发；单个 IP 首秒最多留 2 条、之后稳态 1 条/秒，日志量比"命中即记"少得多。
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `LOG_QUOTA_RATE` / `LOG_QUOTA_BURST` | `1/second` / `2` | 每个源 IP 的配额。想多留证据可调大到 `2/second` / `5` |
-| `LOG_QUOTA_TIMEOUT` | `60s` | 配额元素空闲多久释放；持续扫描的 IP 会一直持有 |
+| `LOG_QUOTA_TIMEOUT` | `60s` | 配额元素空闲多久释放；持续扫描的 IP 会一直持有。**不要写 `0s`**：nft 接受但含义是"无超时"，元素永不释放，set 只增不减 |
 | `LOG_QUOTA_SET4/6_MAXELEM` | `65536` / `65536` | 能同时跟踪的源数（`V6_AGG_PREFIXLEN < 128` 时 v6 按前缀计，即"前缀数"；默认逐地址时按地址计）。正常不会满（见下），是极端情况的安全边界；**真满了该族的新源完全不写日志、不进黑名单** |
 | `LOG_GLOBAL_RATE` / `BURST` | `100/second` / `150` | 每条规则的总量兜底（不区分来源 IP）。实际天花板是「规则条数 × 本值」；它同时是 set 元素的创建速率上限，用户态单线程约几百条/秒就饱和，不宜再调大 |
 
-把 `USE_LOG_QUOTA` 设为 `False` 会退回旧的"单条规则 + 全局限速"：`HASHLIMIT_RATE`（默认 `5/sec`）配 `HASHLIMIT_BURST`（默认 `10`）。这条路径**不区分来源 IP**，一个 IP 打满 5/s 就能让其他来源的扫描不写日志，只作 nft 版本过旧时的退路。
-
-`USE_HASHLIMIT`（默认 `True`）是这条退路的限速总开关：设 `False` 后日志规则完全不带 `limit`，每个命中包都写一条内核日志，只在短时调试时用——长时间开着会把 journal 灌满，日志缓冲超过 1MB 还会丢弃旧数据。
-
-per-IP 配额本身依赖 nft 的 dynamic set（要求 ≥ 1.0.6）；若目标机报 `update` 语法错误，就把 `USE_LOG_QUOTA` 切回 `False`。
+per-IP 配额依赖 nft 的 dynamic set 与 `update @set { ... limit ... }`（要求 ≥ 1.0.6，1.0.9 已实测），`nft < 1.0.6` 会直接报 `update` 语法错误，须先升级 nftables。限速必须按源 IP 分桶：nft 的 `limit` 是每条规则一个令牌桶、所有来源共享，单个 IP 打满就能让其他来源的日志全部丢失，等于被单点噪音致盲。
 
 **为什么正常不会被灌满**
 
@@ -380,12 +376,16 @@ nft 的规则语句顺序执行、任一 match 失败即中断整条规则，所
 | 前缀非空、不含 `"` 与换行、≤120 **字节**（UTF-8 编码后，中文 1 字 3 字节） | 前缀是直接拼进 `log prefix "..."` 的；实测 127 字节 nft 就报 `log prefix is too long` |
 | 两个前缀不相等、且不互为子串 | **这类错误 nft 不会报，只会静默失效**：所有扫描日志都被判成 ICMP 探测，端口扫描永不封禁 |
 | 端口在 1~65535 内 | 越界值会写进 nft set，整表加载失败 |
-| 速率形如 `1/second`、`timeout` 带单位 | 实测 `timeout 60`（漏单位）直接语法错误，而 nft 的报错只给行号 |
+| 速率形如 `1/second`、`timeout` 带单位且数值 ≥ 1 | 实测 `timeout 60`（漏单位）直接语法错误，而 nft 的报错只给行号；`rate 0/second` 会被 nft 拒绝导致整表加载失败；`timeout 0s` 语法合法但实测含义是「无超时」——元素永不释放，配额 set 只增不减，满了该族新源就不写日志、不进黑名单，且启动无任何报错 |
 | `BAN_TIME` / `burst` 为正整数 | 拼进 `timeout 86400s` / `burst N`，非法值整表加载失败 |
-| `LOG_QUOTA_SET4/6_MAXELEM`、`SET4/6_MAXELEM` 为正整数 | `size 0` 时 nft 的报错会**错位到别的行**（实测报的是后面那行的 `unexpected '}'`），根本看不出是 size 写错了。黑名单那两项与 `USE_LOG_QUOTA` 无关，任何模式下都会校验 |
+| `LOG_QUOTA_SET4/6_MAXELEM`、`SET4/6_MAXELEM` 为正整数 | `size 0` 时 nft 的报错会**错位到别的行**（实测报的是后面那行的 `unexpected '}'`），根本看不出是 size 写错了。黑名单两项与日志配额是两套 set，各自校验 |
 | `V6_AGG_PREFIXLEN` 在 `32`–`128` 内 | 越界会让 `ipaddress` 抛异常；比 `/32` 更粗的前缀会把海量无关地址并进同一个封禁槽位，一次误判等于封掉一大片 |
+| `NFT_PREROUTING_PRIORITY` 为整数 | 生成的是 `priority -110;`，写成字符串或 `dstnat - 10` 这类表达式会直接语法错误 |
 
-`ENABLE_ICMP_BAN=True` 配 `ENABLE_ICMP_LOG=False` 只告警不退出（该组合不影响端口扫描封禁，硬退出会让服务起不来）。
+两类情况只告警、不退出：
+
+- `ENABLE_ICMP_BAN=True` 配 `ENABLE_ICMP_LOG=False`：不影响端口扫描封禁，硬退出会让服务起不来。
+- `NFT_PREROUTING_PRIORITY >= -100`：取值本身合法，nft 也接受，但规则会排在 Docker DNAT（`-100`）之后或与之同时——此时 `dport` 已被改写成容器内端口，清单里的宿主机端口一个都匹配不到，**不报任何错，防护静默失效**。非 Docker 环境用 `-10` 属正常，所以只告警。
 
 ### 6.3 语法检查
 
@@ -433,9 +433,9 @@ sudo /root/port_scan_guard/venv/bin/python3 \
 - `[!] 离线库不存在` / `[!] IPv4 离线库未加载` → 检查 xdb 路径/权限；不影响封禁功能。
 - `[!] 日志流异常` / `[!] 日志流已中断` → 脚本会在 5 秒后自动重连。
 - `黑名单容量` 显示的是**两侧同时装到上限**的最坏情况，不是启动即占用的内存：`size` 只声明上限、不预分配，实际水位几十到几百条时几乎不占。它的用处是出事时对账——`nft list set inet <表名> <表名>_bl4` 的元素数逼近这个数字，就该调容量或开 v6 聚合（见 [`SET4_MAXELEM`](#62-必须确认的配置项)）。紧跟的 `配额 set 容量` 同理，而且满载更隐蔽：只丢日志、不丢包，库里连痕迹都没有。
-- `日志配额: 每源 IP 1/second` 是**按源地址分桶**的：每个 IP 有自己的令牌桶，谁也挤不掉谁。配额给小不影响封禁——**封禁只需要 1 条日志**，burst 2 已足够触发；反而比全局限速更省日志，单个 IP 首秒最多 2 条、之后稳态 1 条/秒。后面的 `100/second` 是**每条规则**的总量兜底（不区分来源 IP），防止海量 IP 各刷配额把内核日志打爆，同时也给 set 元素的创建速率封顶；实际天花板是"规则条数 × 100/s"，不是整机 100/s。调参见 [`USE_LOG_QUOTA`](#62-必须确认的配置项)。
+- `日志配额: 每源 IP 1/second` 是**按源地址分桶**的：每个 IP 有自己的令牌桶，谁也挤不掉谁。配额给小不影响封禁——**封禁只需要 1 条日志**，burst 2 已足够触发；单个 IP 首秒最多 2 条、之后稳态 1 条/秒，日志量远低于命中即记。后面的 `100/second` 是**每条规则**的总量兜底（不区分来源 IP），防止海量 IP 各刷配额把内核日志打爆，同时也给 set 元素的创建速率封顶；实际天花板是"规则条数 × 100/s"，不是整机 100/s。调参见[日志配额](#62-必须确认的配置项)。
 - **ICMP 是否占配额 = 是否"真的会封禁"**，即 `ENABLE_ICMP_BAN=True` **且** `DRY_RUN=False`：
-  - 不占配额（默认，或 `DRY_RUN=True`）→ 规则**不带** `update @..._lq4`，只受各自 `100/second` 兜底。因为 ICMP 不封禁，让它占配额会被"每秒 1~2 个 ping"反向利用：同一 IP 的端口扫描将永远写不进日志、永不被封。副作用是 ping flood 时日志上限从旧版全局限速的 `5/s` 变成每规则 `100/s`；用户态还有 10 秒去重（同一 IP 每 10 秒最多 1 行），实际写库量远低于此。
+  - 不占配额（默认，或 `DRY_RUN=True`）→ 规则**不带** `update @..._lq4`，只受各自 `100/second` 兜底。因为 ICMP 不封禁，让它占配额会被"每秒 1~2 个 ping"反向利用：同一 IP 的端口扫描将永远写不进日志、永不被封。副作用是 ping flood 时日志上限变成每规则 `100/s`；用户态还有 10 秒去重（同一 IP 每 10 秒最多 1 行），实际写库量远低于此。
   - 占配额（`BAN=True` 且 `DRY_RUN=False`）→ 规则**带** `update @..._lq4`，与 TCP/UDP 共享该 IP 的桶。此时不存在上述绕过（第一个 ping 就把自己封了），配额反而保证"每 IP 至少一条记录"。
   - **`DRY_RUN=True` 时 ICMP 一定不占配额**：那时候 ping 并不会被封，占了配额只会把同一 IP 的扫描日志挤掉，让观察期数据失真（看起来"没人扫我"），而这种失真恰好在切生产前最难发现。
 
@@ -712,7 +712,7 @@ sqlite3 /root/port_scan_guard/scan.db ".backup /root/port_scan_guard/scan.db.bak
 ### 13.4 更新脚本
 
 ```bash
-#备份旧版本脚本，下载最新脚本，然后重启服务
+#备份现有脚本，下载最新脚本，然后重启服务
 sudo systemctl restart port-scan-guard
 ```
 
@@ -725,15 +725,15 @@ sudo systemctl restart port-scan-guard
 | 服务启动后无事件 | 内核日志源不可用 | 执行 2.2 节测试；检查 `nf_log_ipv4/ipv6` |
 | `[!] 离线库不存在` | xdb 路径/权限错 | `ls -l /root/port_scan_guard/*.xdb` |
 | `[!] nft 添加元素失败` | nft 版本/权限；或 set 已满（此时报的是 `Too many open files in system`，别去查 ulimit） | `nft --version`；`nft list set inet port_scan_guard_host port_scan_guard_host_bl4` 看元素数是否逼近容量 |
-| `[!] 恢复封禁记录部分失败：成功 X 条 / 失败 Y 条` | 旧封禁数超过当前 `SET4/6_MAXELEM`，超出的批次写不进去。报错文案同样是 `Too many open files in system` | 调大容量后重启；失败那批的元素信息已随旧表删除，确需恢复只能按 `bans` 表手工重封 |
-| IPv6 明明已封禁，流量却照过（日志里也没有 `ban_failed`） | **仅开启聚合后**（`V6_AGG_PREFIXLEN < 128`）会出现：set 里存的是未归一的主机地址，而匹配是 `ip6 saddr & <mask>`，掩码后查不到——封禁记录躺着但完全不生效，且 nft 不报错 | `nft list set inet port_scan_guard_host port_scan_guard_host_bl6` 看元素形态；重启服务（启动恢复时会把旧元素归一），或按 [11.2](#112-手动解封) 删掉重封 |
+| `[!] 恢复封禁记录部分失败：成功 X 条 / 失败 Y 条` | 旧封禁数超过当前 `SET4/6_MAXELEM`，超出的批次写不进去。报错文案同样是 `Too many open files in system` | 调大容量后重启；失败那批的元素信息已随重建前的表一起删除，确需恢复只能按 `bans` 表手工重封 |
+| IPv6 明明已封禁，流量却照过（日志里也没有 `ban_failed`） | **仅开启聚合后**（`V6_AGG_PREFIXLEN < 128`）会出现：set 里存的是未归一的主机地址，而匹配是 `ip6 saddr & <mask>`，掩码后查不到——封禁记录躺着但完全不生效，且 nft 不报错 | `nft list set inet port_scan_guard_host port_scan_guard_host_bl6` 看元素形态；重启服务（启动恢复时会把已有元素归一），或按 [11.2](#112-手动解封) 删掉重封 |
 | 自己从公网访问被误封 | 公网 IP 未加白名单 | 加入 `EXTRA_WHITELIST` 或注释掉端口 |
 | Docker 映射端口连不上 | 链里有 `accept`（应为 `return`） | `nft list chain inet port_scan_guard_host prerouting \| grep wl4` |
-| `protocol` 全为 NULL | 旧库升级后的老数据 | 确认当前脚本 `PORT_SCAN_RE` 里 `PROTO` 在 `DPT` 之前 |
+| `protocol` 全为 NULL | 数据库里的历史记录（写入时未解析协议） | 当前脚本正常不会产生 NULL，确认 `PORT_SCAN_RE` 里 `PROTO` 在 `DPT` 之前 |
 | `scan.db` 增长太快 | 被持续扫描 + 去重窗口小 | 调大 `BAN_DEDUP_WINDOW`，或暂时保持 `DRY_RUN=True` |
 | 服务反复退出/重启 | nft 配置错误或权限不足（`setup_firewall` 失败会退出） | `journalctl -u port-scan-guard -n 100 --no-pager` |
 | 启动时报 `conntrack` 相关错误 | 内核缺 `nf_conntrack` | 设 `UDP_NEW_CONN_ONLY=False`、`ENABLE_FLAG_SCAN=False`，或 `modprobe nf_conntrack` |
-| 启动报 `update ... syntax error` | nft 过旧，不支持 dynamic set | 设 `USE_LOG_QUOTA=False` 回到全局限速 |
+| 启动报 `update ... syntax error` | nft < 1.0.6，不支持 dynamic set | 升级 nftables 到 ≥ 1.0.6 |
 | 某个来源的扫描没被封 | 该 IP 配额在窗口内已用尽（首秒只记前 2 个，之后每秒 1 个） | 属预期：封禁只需 1 条日志；要留更多证据就调大 `LOG_QUOTA_BURST` |
 | 前 N 个来源被封，之后的新来源都不封（N 接近 set 容量） | `_lq4` / `_lq6` 被填满，`update` 失败会中断整条 log 规则。正常不会发生：兜底 `limit` 已前置，单条规则的创建速率被封顶在 100/s，4 条规则累加后稳态上限约 24000，对 65536 有 2 倍以上余量 | 用 `nft list set inet <表名> <表名>_lq4` 看元素数；调小 `LOG_QUOTA_TIMEOUT`（如 `10s`）或增大 `LOG_QUOTA_SET4_MAXELEM`；临时处置 `nft flush set inet <表名> <表名>_lq4` |
 | 某 IP 一直在扫却始终不封，同时它还在 ping 本机 | `ENABLE_ICMP_BAN=True` 时 ICMP 会占用该 IP 的配额；若这些 ping 恰好没被封（如落在去重窗口或配额之外），扫描仍会被卡住 | 改回 `ENABLE_ICMP_BAN=False`（默认，ICMP 不占配额） |
