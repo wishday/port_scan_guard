@@ -1,5 +1,4 @@
 #!/root/port_scan_guard/venv/bin/python3
-# -*- coding: utf-8 -*-
 """
 port_scan_guard_nft.py
 
@@ -44,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Optional
 
 # ============================================================
 #                      1. 端口配置区
@@ -487,7 +487,7 @@ def sh(cmd, check=False, timeout=CMD_TIMEOUT):
     except subprocess.TimeoutExpired:
         print(f"[!] 命令超时({timeout}s): {argv}", flush=True)
         return subprocess.CompletedProcess(argv, 1, "", "timeout")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - 命令边界兜底，避免单次调用拖垮主流程
         print(f"[!] 命令异常: {argv} -> {e}", flush=True)
         return subprocess.CompletedProcess(argv, 1, "", str(e))
 
@@ -502,12 +502,12 @@ def _nft_load(text):
         return subprocess.run(
             ["nft", "-f", "-"],
             input=text, capture_output=True, text=True,
-            timeout=CMD_TIMEOUT,
+            timeout=CMD_TIMEOUT, check=False,
         )
     except subprocess.TimeoutExpired:
         print("[!] nft -f 超时", flush=True)
         return subprocess.CompletedProcess(["nft"], 1, "", "timeout")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - nft 加载边界兜底，必须返回失败让调用方回滚
         print(f"[!] nft -f 异常: {e}", flush=True)
         return subprocess.CompletedProcess(["nft"], 1, "", str(e))
 
@@ -985,11 +985,15 @@ def _build_nft_config():
     #     本来就能让第三方被封，FIN+invalid 不比它更强。
     if tcp_ports and ENABLE_FLAG_SCAN:
         flag_matches = (
-            f"tcp dport @{NFT_TABLE}_tcp tcp flags fin "
-            f"ct state invalid,untracked",
-            f"tcp dport @{NFT_TABLE}_tcp "
-            f"tcp flags & (fin|syn|rst|psh|ack|urg) == 0 "
-            f"ct state invalid,untracked",
+            (
+                f"tcp dport @{NFT_TABLE}_tcp tcp flags fin "
+                f"ct state invalid,untracked"
+            ),
+            (
+                f"tcp dport @{NFT_TABLE}_tcp "
+                f"tcp flags & (fin|syn|rst|psh|ack|urg) == 0 "
+                f"ct state invalid,untracked"
+            ),
         )
         for m in flag_matches:
             _emit_log_rule(m, PORT_SCAN_PREFIX, "warn")
@@ -1085,8 +1089,7 @@ def setup_firewall():
                     t = BAN_TIME
                 if t <= 0:
                     continue
-                if t > BAN_TIME:
-                    t = BAN_TIME
+                t = min(t, BAN_TIME)
                 # ★ 库里存的是封禁时的原始地址，未必已是归一后的前缀；
                 #   新表的匹配若带掩码（V6_AGG_PREFIXLEN < 128），必须归一后
                 #   再写，否则这些元素躺在表里但永远匹配不到 —— 封禁静默
@@ -1237,9 +1240,8 @@ def _load_searcher(xdb_path, ip_version):
         return None
 
     try:
-        import ip2region.util as util
-        import ip2region.searcher as searcher
-    except Exception as e:
+        from ip2region import searcher, util
+    except Exception as e:  # noqa: BLE001 - 第三方库导入失败原因多样，统一降级为离线查询不可用
         print(f"[!] py-ip2region 未安装或导入失败: {e}", flush=True)
         return None
 
@@ -1259,8 +1261,8 @@ def _load_searcher(xdb_path, ip_version):
             continue
         try:
             return fn(ver, xdb_path)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - 兼容不同版本 API，失败后继续尝试下一种
+            print(f"[!] 离线库加载 API {api_name} 失败: {e}", flush=True)
 
     # 回退：手工加载向量索引再建 searcher
     # （兼容 snake_case 与 camelCase 两种 API 命名）
@@ -1278,10 +1280,11 @@ def _load_searcher(xdb_path, ip_version):
                 continue
             try:
                 return fn(ver, xdb_path, vec)
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as e:  # noqa: BLE001 - 兼容不同版本 API，失败后统一报错
+                print(f"[!] 离线库向量索引 API {api_name} 失败: {e}",
+                      flush=True)
+    except Exception as e:  # noqa: BLE001 - 回退路径整体失败，最终会打印统一错误
+        print(f"[!] 离线库向量索引加载失败: {e}", flush=True)
 
     print(f"[!] {xdb_path} 无法通过任何已知 API 加载", flush=True)
     return None
@@ -1300,7 +1303,7 @@ def init_ip_lookup():
     try:
         _db_conn = sqlite3.connect(DB_PATH, timeout=10,
                                    check_same_thread=False)
-    except Exception as e:
+    except (sqlite3.Error, OSError) as e:
         sys.exit(f"[!] 打开数据库失败 {DB_PATH}: {e}")
     _db_conn.execute("PRAGMA journal_mode=WAL")
     _db_conn.execute("PRAGMA synchronous=NORMAL")
@@ -1370,7 +1373,7 @@ def _cleanup_db():
                 _db_conn.execute("VACUUM")
                 _db_conn.commit()
                 print("[*] VACUUM 完成", flush=True)
-    except Exception as e:
+    except (sqlite3.Error, OSError) as e:
         print(f"[!] 清理旧记录失败: {e}", flush=True)
 
 
@@ -1419,7 +1422,7 @@ def _query_offline(ip: str) -> dict:
             "city":     _region_field(parts[2]),
             "isp":      _region_field(parts[3]),
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - 离线库是第三方解析，查询失败不能影响封禁
         print(f"[!] 离线查询失败 {ip}: {e}", flush=True)
         return {}
 
@@ -1439,7 +1442,8 @@ def _query_online(ip: str) -> dict:
         return {}
     try:
         import requests
-    except Exception:
+    except ImportError:
+        # requests 是可选依赖；未安装时静默禁用在线查询，离线库仍可用。
         return {}
     try:
         resp = requests.get(
@@ -1463,7 +1467,7 @@ def _query_online(ip: str) -> dict:
             "city":     data.get("city")       or UNKNOWN,
             "isp":      data.get("isp")        or UNKNOWN,
         }
-    except Exception as e:
+    except (requests.RequestException, ValueError, TypeError, AttributeError) as e:
         _online_fail_until = time.time() + ONLINE_FAIL_BACKOFF
         print(f"[!] 在线查询失败 {ip}: {e}"
               f"（{ONLINE_FAIL_BACKOFF}s 内不再尝试在线查询）", flush=True)
@@ -1664,7 +1668,7 @@ def _write_record(job, allow_online=True):
                 ),
             )
             _db_conn.commit()
-    except Exception as e:
+    except (sqlite3.Error, OSError) as e:
         print(f"[!] 写库失败 {job['ip']}: {e}", flush=True)
 
     if job["kind"] == "icmp":
@@ -1695,7 +1699,7 @@ def _record_worker_loop():
         try:
             # 退出阶段只查离线库，避免在线查询（最长数秒）拖住退出。
             _write_record(job, allow_online=not _record_stop.is_set())
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - 单条记录失败不能终止写库线程
             print(f"[!] 记录处理异常 {job.get('ip')}: {e}", flush=True)
 
 
@@ -1758,7 +1762,8 @@ def _stop_record_worker() -> bool:
     return True
 
 
-def ban(ip: str, port: int = None, protocol: str = None,
+def ban(ip: str, port: Optional[int] = None,  # noqa: UP045 - 保持 Python 3.7 兼容
+        protocol: Optional[str] = None,  # noqa: UP045 - 保持 Python 3.7 兼容
         kind: str = "scan", event_type: str = "port_scan"):
     """把 IP 加入 nft 黑名单并记录。
 
@@ -2067,7 +2072,7 @@ def _in_container() -> bool:
         try:
             with open(path, "r") as f:
                 content = f.read()
-        except Exception:
+        except OSError:
             continue
         if any(x in content for x in markers):
             return True
@@ -2088,8 +2093,8 @@ def _startup_selfcheck():
                     print(f"[!] nf_log_all_netns = {v}（容器部署应为 1）。"
                           f"宿主执行: sysctl -w net.netfilter.nf_log_all_netns=1",
                           flush=True)
-        except Exception:
-            pass
+        except OSError as e:
+            print(f"[!] 启动自检：读取 nf_log_all_netns 失败: {e}", flush=True)
 
     # NET_ADMIN（容器需 --cap-add=NET_ADMIN；无需 NET_RAW）
     if shutil.which("capsh"):
@@ -2220,7 +2225,7 @@ def main():
                 else:
                     open_fail_count = 0
                     print("[!] 日志流已中断，5 秒后重连…", flush=True)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - 日志循环边界，任何异常都应重连而不是退出
             open_fail_count += 1
             if not _shutdown_requested:
                 print(f"[!] 日志流异常（连续 {open_fail_count} 次）: {e}，"
@@ -2236,9 +2241,10 @@ def main():
                         try:
                             proc.wait(timeout=1)
                         except subprocess.TimeoutExpired:
-                            pass
-                except Exception:
-                    pass
+                            print(f"[!] 日志进程 {proc.pid} 未能终止，"
+                                  f"可能残留到下次启动", flush=True)
+                except (OSError, subprocess.SubprocessError) as e:
+                    print(f"[!] 终止日志进程失败: {e}", flush=True)
         if not _shutdown_requested:
             if open_fail_count >= 5:
                 # 没有可用的日志源 = 永远不会触发封禁。继续以 active 状态
@@ -2264,8 +2270,8 @@ if __name__ == "__main__":
             if worker_stopped:
                 try:
                     _db_conn.close()
-                except Exception:
-                    pass
+                except (sqlite3.Error, OSError) as e:
+                    print(f"[!] 关闭数据库连接失败: {e}", flush=True)
             else:
                 print("[!] 数据库连接未显式关闭：后台写库线程未结束，"
                       "交由进程退出回收", flush=True)

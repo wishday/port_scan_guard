@@ -748,7 +748,7 @@ sudo systemctl restart port-scan-guard
 | 日志里出现 `[!!] nft 表 ... 已不存在` | 有人/别的服务删了整张表（`systemctl restart nftables`、`nft flush ruleset`、Docker 重配网络）。此时**规则和黑名单全没了**，脚本只会写 `ban_failed` | `nft list table inet port_scan_guard_host` 确认；`systemctl restart port-scan-guard` 重建。脚本不会自动重建，详见下方说明 |
 | 启动即退出，提示「配置校验未通过」 | 表名/前缀/速率/端口清单有非法值 | 按提示逐条改脚本顶部配置区；`journalctl -u port-scan-guard -n 20 --no-pager` 看完整清单 |
 
-> 注意：日志源本身不可用时，脚本不会退出，而是每 5 秒自动重连；真正导致进程退出的通常是 `setup_firewall` 的 nft 配置/权限失败。
+> 注意：日志源本身不可用时，脚本会每 5 秒自动重连；连续 5 次仍不可用则退出，由 systemd 重启/告警，避免进程显示 `active` 却永远收不到日志。`setup_firewall` 的 nft 配置/权限失败会立即退出。
 
 常用命令：
 
