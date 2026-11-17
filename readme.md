@@ -302,35 +302,18 @@ IPv6 的封禁与日志配额按这个前缀长度聚合：`128` 表示**逐地�
 
 > **从聚合版切回 `128` 时**：set 里原有的元素是归一后的前缀地址（如 `2001:db8:77::`），改回逐地址后只有"源地址恰好等于该网络地址"的包才会命中，等于失效。启动恢复逻辑（`_restore()`）无法反推出原来的主机地址——那段信息在归一时就已经丢了。影响有限：最多 `BAN_TIME`（24 小时）后自然清空，期间这些来源只是失去"全端口封禁"，监测端口仍由独立的 drop 规则拦截。想立刻清干净就 `nft flush set inet <表名> <表名>_bl6`。
 
-> 实测说明：聚合靠 nft 表达式 `ip6 saddr & <mask>` 实现，`/64` 的掩码是 `ffff:ffff:ffff:ffff::`。**不能写成 `::ffff:ffff:ffff:ffff`**——那是保留低 64 位（接口标识），实测 3 个同 `/64` 源会分别产生 3 个元素 `::a1 / ::a2 / ::a3`，完全没有聚合效果。
-
 **`SET4_MAXELEM` / `SET6_MAXELEM`（黑名单容量）**
 
-默认两侧都是 `524288`（IPv4 / IPv6，即 2^19）。这是**黑名单 set** 的上限，别和日志配额的 `LOG_QUOTA_SET4/6_MAXELEM`（两侧都是 `65536`）搞混，两者是两套 set。
-
-`size` 只是**上限、不预分配**：实测空 set 无论 `size` 写多大都占 0 字节，代价只在真的装到那个数量时才产生。实测每元素约 **200 字节**（IPv4 196B / IPv6 214B，带 timeout 扩展），所以推满的内存是：
+默认两侧都是 `524288`（IPv4 / IPv6，即 2^19）。这是**黑名单 set** 的上限，`size` 只是**上限、不预分配**：每元素约 **200 字节**（IPv4 196B / IPv6 214B，带 timeout 扩展），所以推满的内存是：
 
 | | 容量 | 每元素 | 推满内存 |
 | --- | --- | --- | --- |
 | IPv4 | `524288` | 196 B | ≈ 98 MB |
 | IPv6 | `524288` | 214 B | ≈ 107 MB |
 
-合计约 **205 MB**，但这是"两侧同时装到上限"的最坏情况。
+合计约 **205 MB**，但这是"两侧同时装到上限"的情况。
 
-> **两侧统一取 `524288` 是权衡，不是各自的最优值。** IPv4 从 `1048576` 降下来，抗灌上限相应从约 2.9 小时缩到约 1.5 小时（按 100 封禁/s 估）——IPv4 没有聚合选项（聚合到 `/24` 会误封同 C 段邻居），容量是它唯一的抗灌手段。实际水位是几十到几百条，`524288` 仍有千倍以上余量，所以这个降幅不影响日常。IPv6 从 `262144` 加上去，收益其实很低：v6 攻击者换源零成本（一个 `/64` 就有 2^64 个地址），灌满速度受**封禁速率**限制而不是容量，翻倍只是把漏封起点往后推一倍。
-
-v6 这一项按**默认的逐地址封禁**规划：不聚合时容量就是唯一的抗灌防线。若把 `V6_AGG_PREFIXLEN` 调成 `64`，一个槽位代表一整个前缀，可以放心调小（如 `65536`，满表 ≈ 14 MB）——**内存紧张时该走这条路，而不是继续加容量**。
-
-满了之后 `add element` 会失败，日志里打出 `[!] nft 添加元素失败`，紧跟着一行点名"是 set 满、不是 fd 耗尽"，库里记 `ban_failed`。**注意 nft 原生的报错是 `Too many open files in system`（ENFILE），跟文件描述符毫无关系**，别被它带偏——这是实测的 set 满文案。已被封的 IP 不受影响，仍按各自的剩余时间过期释放。
-
-重启时的恢复也按 10000 条一批提交，而不是一次性 batch：`nft -f` 遇到一条写不进去就会中断整个脚本，一次性提交等于"超容量一条，全部封禁一起丢"。分批后只会丢掉装不下的尾部，日志里打 `[!] 恢复封禁记录部分失败：成功 X 条 / 失败 Y 条`。
-
-降级后果是温和的：`tcp dport @.._tcp ... drop` 是无条件规则、不依赖黑名单，扫描监测端口的包照样被丢；只是这些 IP 不再获得"全端口封禁"。真要查当前水位：
-
-```bash
-sudo nft list set inet port_scan_guard_host port_scan_guard_host_bl4
-sudo nft list set inet port_scan_guard_host port_scan_guard_host_bl6
-```
+黑名单打满降级后果是温和的：`tcp dport @.._tcp ... drop` 是无条件规则、不依赖黑名单，扫描监测端口的包照样被丢；只是这些 IP 不再获得"全端口封禁"。
 
 **`DB_RETENTION_DAYS`**
 
@@ -368,23 +351,13 @@ sudo nft list set inet port_scan_guard_host port_scan_guard_host_bl6
 | `LOG_QUOTA_SET4/6_MAXELEM` | `65536` / `65536` | 能同时跟踪的源数（`V6_AGG_PREFIXLEN < 128` 时 v6 按前缀计，即"前缀数"；默认逐地址时按地址计）。正常不会满（见下），是极端情况的安全边界；**真满了该族的新源完全不写日志、不进黑名单** |
 | `LOG_GLOBAL_RATE` / `BURST` | `100/second` / `150` | 每条规则的总量兜底（不区分来源 IP）。实际天花板是「规则条数 × 本值」；它同时是 set 元素的创建速率上限，用户态单线程约几百条/秒就饱和，不宜再调大 |
 
-把 `USE_LOG_QUOTA` 设为 `False` 会退回旧的"单条规则 + 全局限速"：`HASHLIMIT_RATE`（默认 `5/sec`）配 `HASHLIMIT_BURST`（默认 `10`），行为与旧版一致。这条路径**不区分来源 IP**，一个 IP 打满 5/s 就能让其他来源的扫描不写日志（就是本节开头说的"被噪音致盲"），只作 nft 版本过旧时的退路。
+把 `USE_LOG_QUOTA` 设为 `False` 会退回旧的"单条规则 + 全局限速"：`HASHLIMIT_RATE`（默认 `5/sec`）配 `HASHLIMIT_BURST`（默认 `10`）。这条路径**不区分来源 IP**，一个 IP 打满 5/s 就能让其他来源的扫描不写日志，只作 nft 版本过旧时的退路。
 
 `USE_HASHLIMIT`（默认 `True`）是这条退路的限速总开关：设 `False` 后日志规则完全不带 `limit`，每个命中包都写一条内核日志，只在短时调试时用——长时间开着会把 journal 灌满，日志缓冲超过 1MB 还会丢弃旧数据。
 
 per-IP 配额本身依赖 nft 的 dynamic set（要求 ≥ 1.0.6）；若目标机报 `update` 语法错误，就把 `USE_LOG_QUOTA` 切回 `False`。
 
-**set 满了会怎样（实测 nft 1.0.9，和直觉相反）**
-
-`update @set { ... limit ... }` 是规则里的一个语句，**set 满导致 update 失败时，整条规则就地中断**，后面的 `log` 不会执行——不是"跳过配额继续记日志"。
-
-后果：该协议族下**新出现的源 IP 一条日志都不写、也不会被封**，直到有元素超时释放（`LOG_QUOTA_TIMEOUT`，默认 60s）。已在 set 里的 IP 不受影响（元素存在时 update 只是刷新，不占新槽位）。drop 是独立规则，照常丢包，所以是**漏封**而不是漏拦。
-
-实测数据（把 set 的 `size` 改成 2 制造满场景）：3 个源各发 4 个 SYN，log 规则计数 `4`（只有前两个源），drop 规则计数 `12`（全部丢弃）。
-
 **为什么正常不会被灌满**
-
-关键在规则的语句顺序：兜底 `limit` 排在 `update` **之前**，即 `tcp dport @..._tcp ... → limit rate 100/second → update @..._lq4 {...} → log`。
 
 nft 的规则语句顺序执行、任一 match 失败即中断整条规则，所以超过兜底限速的包**根本走不到 `update`**，不会占用 set 槽位。于是：
 
@@ -393,17 +366,11 @@ nft 的规则语句顺序执行、任一 match 失败即中断整条规则，所
 - 稳态元素数上限 ≈ `规则数 × 100/s × LOG_QUOTA_TIMEOUT(60s)` ≈ **24000**（开 ICMP 封禁 ≈ 30000）
 - 所以容量取 `65536`（两侧一致），留 2 倍以上余量
 
-> 早期版本 v6 侧用的是 `16384`，按"单规则 100/s"估算看着够（6000 元素），但漏掉了规则条数累加这个因素——真遇到 v6 随机源扫描时会被填满，填满即漏封。已统一为 `65536`。
-
-早期版本的顺序是反的（`update` 在前、`limit` 在后），被兜底丢掉的包照样先建了元素，`LOG_GLOBAL_RATE` 等于没保护到 set。攻击者用大量不同源地址发包即可无上限地灌：1000 pps 随机源下，`65536` 槽约 **65 秒**就填满，随后该族彻底漏封且日志里毫无痕迹。该顺序已修正。
-
-真在 `nft list set inet <表名> <表名>_lq4` 里看到元素数逼近容量时，再考虑调小 `LOG_QUOTA_TIMEOUT`（元素只需覆盖"首包 → 写入黑名单"的几秒窗口，`10s` 足够）或调大容量——`10s` 只会让单 IP 的日志上限更严格（每 10 秒 2 条），不影响"1 条即封"。
-
 **`NFT_TABLE` / 日志前缀（容器场景重点）**
 
 默认表名 `port_scan_guard_host`，日志前缀 `HOST_SCAN:`（端口扫描）与 `HOST_ICMP:`（ICMP）。容器与宿主机必须使用**不同**前缀，否则会同时封禁——详见[第十五节](#十五容器--macvlan-部署)。
 
-改完不必翻代码核对：启动时的 `[*] nft 表：inet ...；日志前缀：... / ...` 一行会打印**当前生效**的表名与两个前缀，加载失败与恢复失败的告警里也会带上它们。nft 自身的报错只给 `/dev/stdin:38:69` 这类行号，不带表名，靠这行才能确认失败的是哪一个实例。
+启动时的 `[*] nft 表：inet ...；日志前缀：... / ...` 一行会打印**当前生效**的表名与两个前缀，加载失败与恢复失败的告警里也会带上它们。nft 自身的报错只给 `/dev/stdin:38:69` 这类行号，不带表名，靠这行才能确认失败的是哪一个实例。
 
 **启动前会自动校验配置**（`_validate_config()`，在 `setup_firewall()` 之前），非法值直接退出并列出全部问题，不会带着坏配置上生产：
 
@@ -465,7 +432,7 @@ sudo /root/port_scan_guard/venv/bin/python3 \
 
 - `[!] 离线库不存在` / `[!] IPv4 离线库未加载` → 检查 xdb 路径/权限；不影响封禁功能。
 - `[!] 日志流异常` / `[!] 日志流已中断` → 脚本会在 5 秒后自动重连。
-- `黑名单容量` 那行显示的是**两侧同时装到上限**的最坏情况，不是启动即占用的内存：`size` 只声明上限、不预分配（实测空 set 占 0 kB），实际水位几十到几百条时几乎不占。它的用处是出事时对账——`nft list set inet <表名> <表名>_bl4` 的元素数逼近这个数字，就该调容量或开 v6 聚合（见 [`SET4_MAXELEM`](#62-必须确认的配置项)）。紧跟的 `配额 set 容量` 同理，而且满载更隐蔽：只丢日志、不丢包，库里连痕迹都没有。
+- `黑名单容量` 显示的是**两侧同时装到上限**的最坏情况，不是启动即占用的内存：`size` 只声明上限、不预分配，实际水位几十到几百条时几乎不占。它的用处是出事时对账——`nft list set inet <表名> <表名>_bl4` 的元素数逼近这个数字，就该调容量或开 v6 聚合（见 [`SET4_MAXELEM`](#62-必须确认的配置项)）。紧跟的 `配额 set 容量` 同理，而且满载更隐蔽：只丢日志、不丢包，库里连痕迹都没有。
 - `日志配额: 每源 IP 1/second` 是**按源地址分桶**的：每个 IP 有自己的令牌桶，谁也挤不掉谁。配额给小不影响封禁——**封禁只需要 1 条日志**，burst 2 已足够触发；反而比全局限速更省日志，单个 IP 首秒最多 2 条、之后稳态 1 条/秒。后面的 `100/second` 是**每条规则**的总量兜底（不区分来源 IP），防止海量 IP 各刷配额把内核日志打爆，同时也给 set 元素的创建速率封顶；实际天花板是"规则条数 × 100/s"，不是整机 100/s。调参见 [`USE_LOG_QUOTA`](#62-必须确认的配置项)。
 - **ICMP 是否占配额 = 是否"真的会封禁"**，即 `ENABLE_ICMP_BAN=True` **且** `DRY_RUN=False`：
   - 不占配额（默认，或 `DRY_RUN=True`）→ 规则**不带** `update @..._lq4`，只受各自 `100/second` 兜底。因为 ICMP 不封禁，让它占配额会被"每秒 1~2 个 ping"反向利用：同一 IP 的端口扫描将永远写不进日志、永不被封。副作用是 ping flood 时日志上限从旧版全局限速的 `5/s` 变成每规则 `100/s`；用户态还有 10 秒去重（同一 IP 每 10 秒最多 1 行），实际写库量远低于此。
@@ -603,49 +570,6 @@ sudo sed -i 's/^DRY_RUN[[:space:]]*=[[:space:]]*True/DRY_RUN    = False/' \
   /root/port_scan_guard/port_scan_guard_nft.py
 sudo systemctl restart port-scan-guard
 ```
-
-验证：
-
-```bash
-sudo nft list chain inet port_scan_guard_host prerouting
-```
-
-`DRY_RUN=False` 时应看到：黑名单规则末尾有 `drop`，且每条**扫描** log 规则后面都跟着一条**独立的**、无 log 的 drop 规则（ICMP 没有对应的 drop 规则：仅记录时就地结束，封禁时由黑名单规则丢弃后续包）。log 规则里有两级限速：**前面**的 `limit rate 100/second` 是每条规则的总量兜底（不区分来源 IP，同时给 set 元素增长封顶），**后面**的 `update @..._lq4 { ip saddr limit ... }` 才是**每个源 IP 自己的配额**——这个顺序是刻意的，见[上一节](#62-必须确认的配置项)里"为什么正常不会被灌满"。**ICMP 那两条在默认配置（`ENABLE_ICMP_BAN=False`）下没有 `update`**，只受总量兜底约束；把 `ENABLE_ICMP_BAN` 设为 `True` 后它们会带上 `update @..._lq4`。原因见下面的显示格式说明：
-
-```
-    ip  saddr @port_scan_guard_host_bl4 counter packets 0 bytes 0 drop
-    ip6 saddr @port_scan_guard_host_bl6 counter packets 0 bytes 0 drop
-    ip  saddr @port_scan_guard_host_wl4 return
-    ip6 saddr @port_scan_guard_host_wl6 return
-    icmp type echo-request limit rate 100/second burst 150 packets log prefix "HOST_ICMP: " level info
-    icmpv6 type echo-request limit rate 100/second burst 150 packets log prefix "HOST_ICMP: " level info
-    meta nfproto ipv4 tcp dport @port_scan_guard_host_tcp tcp flags syn / syn,ack limit rate 100/second burst 150 packets update @port_scan_guard_host_lq4 { ip saddr limit rate 1/second burst 2 packets } log prefix "HOST_SCAN: " level warn
-    meta nfproto ipv6 tcp dport @port_scan_guard_host_tcp tcp flags syn / syn,ack limit rate 100/second burst 150 packets update @port_scan_guard_host_lq6 { ip6 saddr limit rate 1/second burst 2 packets } log prefix "HOST_SCAN: " level warn
-    tcp dport @port_scan_guard_host_tcp tcp flags syn / syn,ack drop
-    meta nfproto ipv4 tcp dport @port_scan_guard_host_tcp tcp flags fin ct state invalid,untracked limit rate 100/second burst 150 packets update @port_scan_guard_host_lq4 { ip saddr limit rate 1/second burst 2 packets } log prefix "HOST_SCAN: " level warn
-    meta nfproto ipv6 tcp dport @port_scan_guard_host_tcp tcp flags fin ct state invalid,untracked limit rate 100/second burst 150 packets update @port_scan_guard_host_lq6 { ip6 saddr limit rate 1/second burst 2 packets } log prefix "HOST_SCAN: " level warn
-    tcp dport @port_scan_guard_host_tcp tcp flags fin ct state invalid,untracked drop
-    meta nfproto ipv4 tcp dport @port_scan_guard_host_tcp tcp flags ! fin,syn,rst,psh,ack,urg ct state invalid,untracked limit rate 100/second burst 150 packets update @port_scan_guard_host_lq4 { ip saddr limit rate 1/second burst 2 packets } log prefix "HOST_SCAN: " level warn
-    meta nfproto ipv6 tcp dport @port_scan_guard_host_tcp tcp flags ! fin,syn,rst,psh,ack,urg ct state invalid,untracked limit rate 100/second burst 150 packets update @port_scan_guard_host_lq6 { ip6 saddr limit rate 1/second burst 2 packets } log prefix "HOST_SCAN: " level warn
-    tcp dport @port_scan_guard_host_tcp tcp flags ! fin,syn,rst,psh,ack,urg ct state invalid,untracked drop
-    meta nfproto ipv4 udp dport @port_scan_guard_host_udp ct state new limit rate 100/second burst 150 packets update @port_scan_guard_host_lq4 { ip saddr limit rate 1/second burst 2 packets } log prefix "HOST_SCAN: " level warn
-    meta nfproto ipv6 udp dport @port_scan_guard_host_udp ct state new limit rate 100/second burst 150 packets update @port_scan_guard_host_lq6 { ip6 saddr limit rate 1/second burst 2 packets } log prefix "HOST_SCAN: " level warn
-    udp dport @port_scan_guard_host_udp drop
-```
-
-> 显示格式说明（nft 1.0.x 的渲染习惯，别误以为规则写错了）：
-> - 链头实际显示为 `type filter hook prerouting priority dstnat - 10;`，`dstnat - 10` 就是 `-110`。
-> - `counter` 会带上计数，显示为 `counter packets N bytes N`。
-> - 配置文件里写的 `tcp flags & (syn|ack) == syn`，列出时显示为 `tcp flags syn / syn,ack`（`值 / 掩码` 写法）。
-> - `tcp flags & (fin|syn|rst|psh|ack|urg) == 0`（NULL 扫描）显示为 `tcp flags ! fin,syn,rst,psh,ack,urg`。
-> - `tcp flags fin` 那两条规则来自 `ENABLE_FLAG_SCAN`（捕获 FIN / XMAS 扫描）；设为 `False` 后这两组规则不会出现。
-> - 两条规则都带 `ct state invalid,untracked`：**扫描包的 conntrack 状态是 `invalid`，正常关闭连接的 FIN+ACK 是 `established`**。靠这个区分，正常回程 FIN（本地临时端口若落在端口清单里）才不会被误封。
-> - 每条 log 规则都成对出现（v4 / v6 各一条），链上显示为 `meta nfproto ipv4 ...` / `meta nfproto ipv6 ...`（nft 1.0.9 实测会显示）。若在更旧的版本上看不到这段、只看到 `lq4` / `lq6` 不同，别以为条件丢了：删掉任一条都会让对应协议族失去配额。
-> - **ICMP 规则在默认模式（仅记录）下不带 `update @..._lq4`**：per-IP 配额的 key 只有源地址，ICMP 会和 TCP/UDP 共用同一个桶；而 ICMP 不封禁，攻击者只要每秒发 1~2 个 ping 就能把该 IP 的配额占满，让同一 IP 的端口扫描永远写不进日志、永不被封。实测：先 ping 2 次再扫 4 个端口，修复前 TCP 日志计数为 0，修复后为 2。
-> - 把 `ENABLE_ICMP_BAN` 设为 `True` 后，ICMP 规则会**带上** `update @..._lq4` / `@..._lq6`：此时 ping 本身就会触发封禁，配额不再被反向利用，反而能保证"每个 ping 源都至少留一条记录"。
-> - 把 `USE_LOG_QUOTA` 设为 `False`，规则会退回单条 + `limit rate 5/second`（不区分来源 IP）的旧形态。
-
-> 说明：log 规则与 drop 规则是**拆开的两条**。因为 nft 的 `limit` 是匹配表达式，若写成 `log ... drop` 一行，超速时 limit 不匹配会中断整条规则、连 drop 一起跳过，形成安全漏洞。
 
 ---
 
@@ -788,14 +712,9 @@ sqlite3 /root/port_scan_guard/scan.db ".backup /root/port_scan_guard/scan.db.bak
 ### 13.4 更新脚本
 
 ```bash
-cd /root/port_scan_guard
-git stash          # 本地用 sed 改过 DRY_RUN 时必须先暂存，否则 pull 冲突
-git pull
-git stash pop      # 暂存的改动会重新应用；若上游改了同一行，按提示解决冲突
+#备份旧版本脚本，下载最新脚本，然后重启服务
 sudo systemctl restart port-scan-guard
 ```
-
-> 数据库为 WAL 模式；旧库升级时，脚本会自动 `ALTER TABLE` 补齐 `port` / `protocol` / `event_type` 缺失列。
 
 ---
 
@@ -825,18 +744,6 @@ sudo systemctl restart port-scan-guard
 | 启动即退出，提示「配置校验未通过」 | 表名/前缀/速率/端口清单有非法值 | 按提示逐条改脚本顶部配置区；`journalctl -u port-scan-guard -n 20 --no-pager` 看完整清单 |
 
 > 注意：日志源本身不可用时，脚本不会退出，而是每 5 秒自动重连；真正导致进程退出的通常是 `setup_firewall` 的 nft 配置/权限失败。
-
-**为什么表被外部删掉后脚本不自己重建**
-
-nft 规则只在启动时装一次（`setup_firewall()`），之后进程只做"往 set 里加元素"。如果整张表被外部删除，进程并不知情，结果是：
-
-```
-drop 规则没了  → 端口直接暴露（没有拦截）
-bl4/bl6 没了   → add element 失败，库里全是 ban_failed
-进程还活着     → systemd 显示 active(running)，最容易误判
-```
-
-脚本会在第一次遇到 `No such file or directory` 时打印 `[!!] nft 表 ... 已不存在` 的醒目告警（10 分钟内不重复），但**不会自动重建**——手工 `nft flush` 调试时如果被脚本反复重建，反而更麻烦。看到告警就 `systemctl restart port-scan-guard`，重启时会按剩余时间恢复黑名单。真要做到自动自愈，需要在主循环里加低频健康检查（每分钟 `nft list table` 一次），属于可选增强。
 
 常用命令：
 
