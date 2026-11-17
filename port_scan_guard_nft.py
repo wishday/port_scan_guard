@@ -18,8 +18,8 @@ port_scan_guard_nft.py
 日志源优先级：systemd 系统优先 journalctl -k -f（数据源优先于文件副本），
 非 systemd 系统回退到 /var/log/kern.log → messages → syslog。
 
-封禁时查询 IP 归属地（离线库优先，缺失时在线补充），
-记录写入 SQLite，方便后续筛选统计。
+封禁时查询 IP 归属地（离线库优先，任一字段缺失时整条改用在线结果），
+记录写入 SQLite；查询与写库在后台线程完成，不阻塞封禁主流程。
 
 依赖：nft (nftables v1.0.6+，1.0.9 已实测)
       /root/port_scan_guard/venv 里的 py-ip2region + requests
@@ -29,9 +29,11 @@ port_scan_guard_nft.py
 """
 
 import atexit
+import heapq
 import ipaddress
 import json
 import os
+import queue
 import re
 import select
 import shlex
@@ -40,6 +42,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 # ============================================================
@@ -190,6 +193,13 @@ PRIVATE_NETS = [
     ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
+]
+
+# 回环网段：与 is_whitelisted() 的回环放行保持一致，本机进程访问监测端口
+# （如 127.0.0.1:8080）不会被 nft 拦截。
+LOOPBACK_NETS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
 ]
 
 # 额外白名单（公网 IP / 网段）。
@@ -392,13 +402,14 @@ DB_PATH        = "/root/port_scan_guard/scan.db"
 XDB_V4         = "/root/port_scan_guard/ip2region_v4.xdb"
 XDB_V6         = "/root/port_scan_guard/ip2region_v6.xdb"
 
-# 在线归属地查询（仅当离线库未命中时使用）
+# 在线归属地查询（离线库任一字段缺失时触发；在线成功则整条采用在线值）
 # ★ ip-api.com 免费版只提供明文 HTTP（无 HTTPS），且会暴露查询的 IP；
 #   介意的话把 ONLINE_API 置空字符串（""）即可完全关闭在线查询。
 ONLINE_API     = ("http://ip-api.com/json/{ip}"
-                  "?lang=zh-CN&fields=status,country,regionName,city,isp")
+                  "?lang=zh-CN&fields=status,message,"
+                  "country,regionName,city,isp")
 # ★ 用 (connect, read) 元组，避免单值 5 被解释为"各 5 秒"最坏 10 秒；
-#   最坏总耗时 5 秒，远离 STOP_GRACE=8 的强制杀死边界
+#   连接/读取最坏共 5 秒。DNS 解析不受此参数约束，由系统 resolver 控制。
 ONLINE_TIMEOUT = (2, 3)
 # 在线查询失败后的熔断时长（秒）：期间不再发起请求，避免封禁路径被拖慢
 ONLINE_FAIL_BACKOFF = 300
@@ -433,6 +444,15 @@ ICMP_PROBE_RE = re.compile(
 _searcher_v4 = None
 _searcher_v6 = None
 _db_conn     = None
+_db_lock     = threading.Lock()   # 主线程清理 / 后台写库线程共用连接
+
+# 归属地记录异步写入：日志消费线程只入队，后台线程查归属地 + 写库 + 打印，
+# 避免在线查询把封禁主路径卡住。队列打满时降级为离线值同步写库。
+_RECORD_QUEUE_MAX = 20000
+_record_queue = queue.Queue(maxsize=_RECORD_QUEUE_MAX)
+_record_worker = None
+_record_stop = threading.Event()
+_last_queue_warn_ts = 0.0
 
 _recent_bans = {}
 _extra_v4    = []
@@ -637,6 +657,21 @@ def _validate_config():
                     or not (1 <= p <= 65535):
                 errs.append(f"{name} 含非法端口 {p!r}（应为 1~65535 的整数）")
 
+    # ---- 白名单网段 ----
+    # _build_nft_config() 会直接访问每个元素的 .version，因此这里要求
+    # 元素必须是 ip_network 对象，启动时给出明确报错。
+    for name, nets in (("PRIVATE_NETS", PRIVATE_NETS),
+                       ("LOOPBACK_NETS", LOOPBACK_NETS),
+                       ("EXTRA_WHITELIST", EXTRA_WHITELIST)):
+        if not isinstance(nets, (list, tuple)):
+            errs.append(f"{name} 必须是列表")
+            continue
+        for n in nets:
+            if not isinstance(n, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+                errs.append(
+                    f"{name} 含非网段元素 {n!r}：必须用 "
+                    f"ipaddress.ip_network(...) 构造，不能直接写字符串")
+
     # ---- 速率 / 超时 ----
     if not _RATE_RE.match(str(LOG_QUOTA_RATE).strip()):
         errs.append(f"LOG_QUOTA_RATE={LOG_QUOTA_RATE!r} 格式应为 "
@@ -703,10 +738,11 @@ def _validate_config():
         errs.append(f"NFT_PREROUTING_PRIORITY={NFT_PREROUTING_PRIORITY!r} "
                     f"必须是整数（默认 -110）。本项目生成的是 "
                     f"`priority -110;`，字符串或表达式会直接语法错误")
-    elif NFT_PREROUTING_PRIORITY > -100:
-        print(f"[!] NFT_PREROUTING_PRIORITY={NFT_PREROUTING_PRIORITY} 晚于 "
-              f"Docker DNAT(-100)：Docker 映射端口的 dport 已被改写，"
-              f"清单里的宿主机端口可能匹配不到（无 Docker 时无影响）",
+    elif NFT_PREROUTING_PRIORITY >= -100:
+        print(f"[!] NFT_PREROUTING_PRIORITY={NFT_PREROUTING_PRIORITY} "
+              f"不早于 Docker DNAT(-100)：等于 -100 时同优先级内各 chain "
+              f"执行顺序不确定；大于 -100 时 dport 已被改写，清单里的"
+              f"宿主机端口可能匹配不到（无 Docker 时无影响）",
               flush=True)
 
     # ---- 开关组合 ----
@@ -727,8 +763,10 @@ def _build_nft_config():
     tcp_ports = sorted(set(TCP_PORTS))
     udp_ports = sorted(set(UDP_PORTS))
 
-    wl4 = [n for n in (PRIVATE_NETS + EXTRA_WHITELIST) if n.version == 4]
-    wl6 = [n for n in (PRIVATE_NETS + EXTRA_WHITELIST) if n.version == 6]
+    # 去重：用户可能把私网/回环段又写进 EXTRA_WHITELIST
+    wl_nets = list(dict.fromkeys(PRIVATE_NETS + LOOPBACK_NETS + EXTRA_WHITELIST))
+    wl4 = [n for n in wl_nets if n.version == 4]
+    wl6 = [n for n in wl_nets if n.version == 6]
 
     # DRY_RUN 时 verdict 为空字符串（规则只 log / 只 counter，不加 verdict）
     # 这样不会用 accept 跳过 Docker DNAT，包继续流向下一个 chain
@@ -978,6 +1016,10 @@ def setup_firewall():
     if shutil.which("nft") is None:
         sys.exit("[!] 未找到 nft 命令，请先安装：apt install nftables")
 
+    # 先生成完整配置再改动现有表：生成阶段若抛异常，当前规则原样保留，
+    # 不会出现无防护窗口。
+    config = _build_nft_config()
+
     # 备份 + 恢复封禁记录
     backup = None
     if _nft_table_exists():
@@ -995,8 +1037,7 @@ def setup_firewall():
     # 删除旧表
     _nft(["delete", "table", "inet", NFT_TABLE])
 
-    # 加载新配置
-    config = _build_nft_config()
+    # 加载新配置（已在改动现有表之前生成）
     r = _nft_load(config)
     if r.returncode != 0:
         # ★ 回滚：重新加载备份，保证系统不裸奔
@@ -1099,6 +1140,14 @@ def cleanup_firewall():
     """
     global _firewall_setup_done
     if not _firewall_setup_done:
+        return
+
+    # 仅主动停服（SIGTERM/SIGINT）才清理规则；异常退出时保留规则，
+    # 避免监测端口在进程崩溃到重启的窗口内失去防护（fail-closed）。
+    if not _shutdown_requested:
+        print("[!] 非正常退出：保留 nft 规则（不 flush），"
+              "避免监测端口在崩溃窗口内失去防护", flush=True)
+        _firewall_setup_done = False
         return
 
     if DESTROY_TABLE_ON_EXIT:
@@ -1204,8 +1253,10 @@ def _load_searcher(xdb_path, ip_version):
             pass
 
     # 回退：手工加载向量索引再建 searcher
-    # （部分版本没有 loadVectorIndexFromFile，用 getattr 避免 AttributeError）
-    load_vec = getattr(util, "loadVectorIndexFromFile", None)
+    # （兼容 snake_case 与 camelCase 两种 API 命名）
+    load_vec = getattr(util, "load_vector_index_from_file", None)
+    if load_vec is None:
+        load_vec = getattr(util, "loadVectorIndexFromFile", None)
     if load_vec is None:
         print(f"[!] {xdb_path} 无法通过任何已知 API 加载", flush=True)
         return None
@@ -1296,18 +1347,19 @@ def _cleanup_db():
 
     cutoff = time.time() - DB_RETENTION_DAYS * 86400
     try:
-        cur = _db_conn.execute("DELETE FROM bans WHERE ts < ?", (cutoff,))
-        deleted = cur.rowcount
-        _db_conn.commit()
-        if deleted and deleted > 0:
-            print(f"[*] 清理旧记录: {deleted} 行 "
-                  f"(保留最近 {DB_RETENTION_DAYS} 天)", flush=True)
-
-        if DB_VACUUM_AFTER_CLEANUP:
-            print("[*] VACUUM 中…（会重写全库，请稍候）", flush=True)
-            _db_conn.execute("VACUUM")
+        with _db_lock:
+            cur = _db_conn.execute("DELETE FROM bans WHERE ts < ?", (cutoff,))
+            deleted = cur.rowcount
             _db_conn.commit()
-            print("[*] VACUUM 完成", flush=True)
+            if deleted and deleted > 0:
+                print(f"[*] 清理旧记录: {deleted} 行 "
+                      f"(保留最近 {DB_RETENTION_DAYS} 天)", flush=True)
+
+            if DB_VACUUM_AFTER_CLEANUP:
+                print("[*] VACUUM 中…（会重写全库，请稍候）", flush=True)
+                _db_conn.execute("VACUUM")
+                _db_conn.commit()
+                print("[*] VACUUM 完成", flush=True)
     except Exception as e:
         print(f"[!] 清理旧记录失败: {e}", flush=True)
 
@@ -1328,6 +1380,12 @@ def _maybe_cleanup_db():
 
 # ---------------- 归属地查询 ----------------
 
+def _region_field(part: str) -> str:
+    """归一化 xdb 字段：官方库用 "0"（或空串）表示未知值。"""
+    part = (part or "").strip()
+    return UNKNOWN if not part or part == "0" else part
+
+
 def _query_offline(ip: str) -> dict:
     searcher = _searcher_v6 if ":" in ip else _searcher_v4
     if searcher is None:
@@ -1336,14 +1394,17 @@ def _query_offline(ip: str) -> dict:
         region = searcher.search(ip)
         if not region:
             return {}
+        # 官方 ip2region_v4/v6.xdb 字段格式：
+        #   Country|Province|City|ISP|iso-alpha2-code
+        # 即 province=parts[1]、city=parts[2]、ISP=parts[3]。
         parts = region.split("|")
-        if len(parts) < 5:
+        if len(parts) < 4:
             return {}
         return {
-            "country":  parts[0] or UNKNOWN,
-            "province": parts[2] or UNKNOWN,
-            "city":     parts[3] or UNKNOWN,
-            "isp":      parts[4] or UNKNOWN,
+            "country":  _region_field(parts[0]),
+            "province": _region_field(parts[1]),
+            "city":     _region_field(parts[2]),
+            "isp":      _region_field(parts[3]),
         }
     except Exception as e:
         print(f"[!] 离线查询失败 {ip}: {e}", flush=True)
@@ -1351,9 +1412,9 @@ def _query_offline(ip: str) -> dict:
 
 
 def _query_online(ip: str) -> dict:
-    # ★ 在线查询在封禁路径上串行执行，失败时最坏阻塞 ONLINE_TIMEOUT 秒，
-    #   且每个新 IP 都会重试一次 → 批量新 IP 时封禁严重滞后、日志刷屏。
-    #   因此失败后熔断一段时间，期间直接跳过（不影响离线库命中）。
+    # ★ 由后台记录线程调用，不阻塞 nft 封禁与日志消费。单次最多阻塞
+    #   ONLINE_TIMEOUT 秒（DNS 解析在 requests timeout 之外，解析异常慢时
+    #   会更久）；失败后熔断，避免连续超时把写库线程卡住。
     global _online_fail_until
 
     # 退出中不再发起网络请求，避免拖慢退出
@@ -1373,8 +1434,15 @@ def _query_online(ip: str) -> dict:
             timeout=ONLINE_TIMEOUT,
             headers={"User-Agent": "port-scan-guard/1.0"},
         )
+        # ★ 免费额度耗尽时 ip-api 返回 HTTP 429 + 正常 JSON 体，不会抛异常；
+        #   不显式 raise 的话下面只能看到 status=fail，熔断永远不触发，
+        #   每次封禁仍会继续打网络。
+        resp.raise_for_status()
         data = resp.json()
         if data.get("status") != "success":
+            _online_fail_until = time.time() + ONLINE_FAIL_BACKOFF
+            print(f"[!] 在线查询失败 {ip}: {data.get('message') or data}"
+                  f"（{ONLINE_FAIL_BACKOFF}s 内不再尝试在线查询）", flush=True)
             return {}
         return {
             "country":  data.get("country")    or UNKNOWN,
@@ -1410,12 +1478,14 @@ def _cache_put(ip: str, info: dict):
         #   丢掉最旧的部分，保证有硬上限（丢掉只是下次重新查询，无副作用）。
         extra = len(_ip_info_cache) - IP_INFO_CACHE_MAX
         if extra > 0:
-            for k, _ in sorted(_ip_info_cache.items(),
-                               key=lambda kv: kv[1][0])[:extra]:
+            # 只取最旧的 extra 条（O(n log k)），避免全量排序。
+            for k, _ in heapq.nsmallest(
+                    extra, _ip_info_cache.items(), key=lambda kv: kv[1][0]):
                 _ip_info_cache.pop(k, None)
 
 
 def get_ip_info(ip: str) -> dict:
+    """离线库优先；任一字段缺失时查询在线，并整条采用在线结果。"""
     cached = _cache_get(ip)
     if cached is not None:
         return cached
@@ -1432,21 +1502,16 @@ def get_ip_info(ip: str) -> dict:
 
     need_online = (
         not info
-        or info.get("country") in (None, "", UNKNOWN)
-        or info.get("isp")     in (None, "", UNKNOWN)
+        or any(info.get(k) in (None, "", UNKNOWN)
+               for k in ("country", "province", "city", "isp"))
     )
 
     if need_online:
         online = _query_online(ip)
         if online:
-            if not info:
-                info = online
-                source = "online"
-            else:
-                for k in ("country", "province", "city", "isp"):
-                    if not info.get(k) or info.get(k) == UNKNOWN:
-                        info[k] = online.get(k, UNKNOWN)
-                source = "offline+online"
+            # 不混用两个数据源：一旦查询成功，整条记录都取在线值
+            info = online
+            source = "online"
 
     for k in ("country", "province", "city", "isp"):
         info.setdefault(k, UNKNOWN)
@@ -1545,9 +1610,123 @@ def _warn_table_lost():
     print("=" * 60, flush=True)
 
 
+# ---------------- 归属地记录异步写入 ----------------
+
+def _offline_info(ip: str) -> dict:
+    """只查离线库并补齐字段。供记录队列打满时的同步降级使用。
+
+    不碰 _ip_info_cache / 熔断状态：这些只由后台线程通过 get_ip_info() 访问，
+    避免两个线程同时改动字典和缓存淘汰。
+    """
+    info = _query_offline(ip)
+    source = "offline" if info else "unknown"
+    for k in ("country", "province", "city", "isp"):
+        info.setdefault(k, UNKNOWN)
+    info["source"] = source
+    return info
+
+
+def _write_record(job, allow_online=True):
+    """查归属地、写库、打印一行记录。"""
+    if allow_online:
+        info = get_ip_info(job["ip"])
+    else:
+        info = _offline_info(job["ip"])
+
+    try:
+        with _db_lock:
+            _db_conn.execute(
+                """INSERT INTO bans
+                   (ts, time_str, ip, family, port, protocol,
+                    country, province, city, isp,
+                    source, duration, result, event_type)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    job["ts"], job["time_str"], job["ip"], job["family"],
+                    job["port"], job["protocol"],
+                    info["country"], info["province"],
+                    info["city"], info["isp"],
+                    info["source"], job["duration"], job["result"],
+                    job["event_type"],
+                ),
+            )
+            _db_conn.commit()
+    except Exception as e:
+        print(f"[!] 写库失败 {job['ip']}: {e}", flush=True)
+
+    if job["kind"] == "icmp":
+        print(f"[{job['time_str']}] icmp_probe {job['ip']} "
+              f"({info['country']}/{info['province']}/"
+              f"{info['city']}/{info['isp']}) [{info['source']}]",
+              flush=True)
+        return
+
+    print(
+        f"[{job['time_str']}] {job['result']} "
+        f"{job['shown']}{job['tag']}{job['trig']} "
+        f"({info['country']}/{info['province']}/{info['city']}/{info['isp']}) "
+        f"[{info['source']}]",
+        flush=True,
+    )
+
+
+def _record_worker_loop():
+    while True:
+        try:
+            job = _record_queue.get(timeout=0.5)
+        except queue.Empty:
+            # 收到停止信号且队列已空才退出；停止后不再有新记录入队
+            if _record_stop.is_set():
+                return
+            continue
+        try:
+            _write_record(job)
+        except Exception as e:
+            print(f"[!] 记录处理异常 {job.get('ip')}: {e}", flush=True)
+
+
+def _enqueue_record(job):
+    """把记录交给后台线程；队列打满时降级为离线值同步写库。"""
+    global _last_queue_warn_ts
+    try:
+        _record_queue.put_nowait(job)
+        return
+    except queue.Full:
+        pass
+
+    now = time.time()
+    if now - _last_queue_warn_ts >= 60:
+        _last_queue_warn_ts = now
+        print(f"[!] 归属地记录队列已满（{_RECORD_QUEUE_MAX} 条），"
+              f"记录降级为离线归属地同步写库", flush=True)
+    _write_record(job, allow_online=False)
+
+
+def _start_record_worker():
+    global _record_worker
+    _record_stop.clear()
+    _record_worker = threading.Thread(target=_record_worker_loop,
+                                      name="record-writer", daemon=True)
+    _record_worker.start()
+
+
+def _stop_record_worker():
+    global _record_worker
+    if _record_worker is None:
+        return
+    _record_stop.set()
+    _record_worker.join(timeout=10)
+    if _record_worker.is_alive():
+        print(f"[!] 退出超时：仍有 {_record_queue.qsize()} 条归属地记录未写库",
+              flush=True)
+    _record_worker = None
+
+
 def ban(ip: str, port: int = None, protocol: str = None,
         kind: str = "scan", event_type: str = "port_scan"):
-    """把 IP 加入 nft 黑名单并写库。
+    """把 IP 加入 nft 黑名单并记录。
+
+    归属地查询与写库在后台线程完成，本函数只负责封禁与入队。
 
     kind / event_type 用于区分来源：
       - 端口扫描：kind="scan"、event_type="port_scan"（默认）
@@ -1621,28 +1800,9 @@ def ban(ip: str, port: int = None, protocol: str = None,
                       f"或临时 nft flush set inet {NFT_TABLE} {setname}",
                       flush=True)
 
-    info = get_ip_info(ip)
-
-    # DRY_RUN 下并没有真的封禁，duration 记 0 更符合实际语义
-    duration = 0 if result == "dry_run" else BAN_TIME
-
-    try:
-        _db_conn.execute(
-            """INSERT INTO bans
-               (ts, time_str, ip, family, port, protocol,
-                country, province, city, isp,
-                source, duration, result, event_type)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                time.time(), time.strftime("%F %T"), ip, family,
-                port, protocol,
-                info["country"], info["province"], info["city"], info["isp"],
-                info["source"], duration, result, event_type,
-            ),
-        )
-        _db_conn.commit()
-    except Exception as e:
-        print(f"[!] 写库失败 {ip}: {e}", flush=True)
+    # 只有真正写进黑名单（result="ban"）才算封禁时长；
+    # DRY_RUN 与 ban_failed 都没有实际生效，记 0 以免统计被高估。
+    duration = BAN_TIME if result == "ban" else 0
 
     tag = ""
     if protocol and port:
@@ -1661,16 +1821,27 @@ def ban(ip: str, port: int = None, protocol: str = None,
         shown = ip
     trig = f" (触发 {ip})" if is_v6 and set_key != ip else ""
 
-    print(
-        f"[{time.strftime('%F %T')}] {result} {shown}{tag}{trig} "
-        f"({info['country']}/{info['province']}/{info['city']}/{info['isp']}) "
-        f"[{info['source']}]",
-        flush=True,
-    )
+    # 归属地查询与写库交给后台线程：nft 封禁已经生效，不再让网络请求
+    # 阻塞日志消费，避免后续来源的封禁被拖后。
+    _enqueue_record({
+        "kind": "ban",
+        "ts": time.time(),
+        "time_str": time.strftime("%F %T"),
+        "ip": ip,
+        "family": family,
+        "port": port,
+        "protocol": protocol,
+        "duration": duration,
+        "result": result,
+        "event_type": event_type,
+        "shown": shown,
+        "tag": tag,
+        "trig": trig,
+    })
 
 
 def record_icmp_probe(ip: str, protocol: str = "ICMP"):
-    """记录 ICMP echo-request 探测：只写数据库，不碰 nft，不丢包。
+    """记录 ICMP echo-request 探测：只记录，不碰 nft，不丢包。
 
     仅在 ENABLE_ICMP_BAN = False（默认）时由 _dispatch_log_line 调用；
     开启 ICMP 封禁后走 ban()，本函数不再参与。
@@ -1689,32 +1860,19 @@ def record_icmp_probe(ip: str, protocol: str = "ICMP"):
     is_v6 = isinstance(addr, ipaddress.IPv6Address)
     family = "ipv6" if is_v6 else "ipv4"
 
-    info = get_ip_info(ip)
-
-    try:
-        _db_conn.execute(
-            """INSERT INTO bans
-               (ts, time_str, ip, family, port, protocol,
-                country, province, city, isp,
-                source, duration, result, event_type)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                time.time(), time.strftime("%F %T"), ip, family,
-                None, protocol,
-                info["country"], info["province"], info["city"], info["isp"],
-                info["source"], 0, "icmp_probe", "icmp",
-            ),
-        )
-        _db_conn.commit()
-    except Exception as e:
-        print(f"[!] 写库失败 {ip}: {e}", flush=True)
-
-    print(
-        f"[{time.strftime('%F %T')}] icmp_probe {ip} "
-        f"({info['country']}/{info['province']}/{info['city']}/{info['isp']}) "
-        f"[{info['source']}]",
-        flush=True,
-    )
+    # 同 ban()：归属地查询与写库交给后台线程，避免阻塞日志消费
+    _enqueue_record({
+        "kind": "icmp",
+        "ts": time.time(),
+        "time_str": time.strftime("%F %T"),
+        "ip": ip,
+        "family": family,
+        "port": None,
+        "protocol": protocol,
+        "duration": 0,
+        "result": "icmp_probe",
+        "event_type": "icmp",
+    })
 
 
 # ---------------- 主流程 ----------------
@@ -1924,16 +2082,17 @@ def main():
     signal.signal(signal.SIGINT,  _handle_sigterm)
     atexit.register(cleanup_firewall)
 
+    # 必须在 setup_firewall() 之前校验：非法配置若进入 nft 加载，报错只有
+    # `/dev/stdin:38:69` 行号；前缀冲突那类错误则完全静默。
+    _validate_config()
+
     _extra_v4 = [n for n in EXTRA_WHITELIST if n.version == 4]
     _extra_v6 = [n for n in EXTRA_WHITELIST if n.version == 6]
-
-    # ★ 必须在 setup_firewall() 之前：非法配置若走到 nft 加载，报错只有
-    #   `/dev/stdin:38:69` 行号；而前缀冲突那类错误连报错都没有，是静默失效。
-    _validate_config()
 
     _startup_selfcheck()
 
     init_ip_lookup()
+    _start_record_worker()
     setup_firewall()
 
     print(f"[*] 已就绪：TCP {len(set(TCP_PORTS))} 个 / "
@@ -2008,16 +2167,28 @@ def main():
     # 启动时立即执行一次清理
     _maybe_cleanup_db()
 
+    open_fail_count = 0
     while not _shutdown_requested:
         proc = None
+        started = time.monotonic()
         try:
             proc = open_log_stream()
             _consume_log_stream(proc)
             if not _shutdown_requested:
-                print("[!] 日志流已中断，5 秒后重连…", flush=True)
+                if time.monotonic() - started < 5:
+                    # 打开后立刻 EOF 通常意味着日志源不可用（无权限、服务未运行），
+                    # 与打开失败同样计数，避免进程 active 却永远收不到日志。
+                    open_fail_count += 1
+                    print(f"[!] 日志流立即结束（连续 {open_fail_count} 次），"
+                          f"5 秒后重连…", flush=True)
+                else:
+                    open_fail_count = 0
+                    print("[!] 日志流已中断，5 秒后重连…", flush=True)
         except Exception as e:
+            open_fail_count += 1
             if not _shutdown_requested:
-                print(f"[!] 日志流异常: {e}，5 秒后重连…", flush=True)
+                print(f"[!] 日志流异常（连续 {open_fail_count} 次）: {e}，"
+                      f"5 秒后重连…", flush=True)
         finally:
             if proc is not None and proc.poll() is None:
                 try:
@@ -2033,6 +2204,11 @@ def main():
                 except Exception:
                     pass
         if not _shutdown_requested:
+            if open_fail_count >= 5:
+                # 没有可用的日志源 = 永远不会触发封禁。继续以 active 状态
+                # 空转只会掩盖故障；退出后由 systemd 的 Restart/启动限流暴露。
+                sys.exit("[!] 连续 5 次无法使用内核日志源，退出。"
+                         "请检查 journalctl / kern.log 后重启服务")
             _maybe_cleanup_db()
             _interruptible_sleep(5)
 
@@ -2045,6 +2221,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[*] 已退出")
     finally:
+        # 先停后台写库线程，再关数据库连接
+        _stop_record_worker()
         if _db_conn is not None:
             try:
                 _db_conn.close()

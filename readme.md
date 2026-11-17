@@ -33,7 +33,7 @@
 - 监听 `TCP_PORTS` / `UDP_PORTS` 清单内的端口，任何**非白名单**来源的入站新连接都会被加入 nft 黑名单（时长 `BAN_TIME`，默认 86400 秒 = 24 小时）。IPv6 来源默认**逐地址**封禁，与 IPv4 语义对称；想让同一前缀共用一个槽位就调 `V6_AGG_PREFIXLEN`。
 - 同时记录 ICMP echo-request（ping）探测：默认只写数据库，不加黑名单、不丢包——用于审计"谁在探测 NAS 是否在线"；把 `ENABLE_ICMP_BAN` 设为 `True` 可改为同样拉黑 24 小时。
 - 规则挂在 `prerouting` 链、优先级 `-110`，即位于 Docker DNAT（`-100`）之前，`saddr` / `dport` 都是原始值。
-- 封禁时查询 IP 归属地（离线库优先，缺失时在线补充），记录写入 SQLite，便于筛选统计。
+- 封禁时查询 IP 归属地（离线库优先；任一字段缺失时改用在线结果），记录写入 SQLite，便于筛选统计。
 
 **能保护**
 
@@ -56,7 +56,7 @@
 **默认放行的地址**
 
 - 私网段：`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`fc00::/7`、`fe80::/10`。
-- 回环、未指定、多播地址一律放行（不是攻击）。
+- 回环（`127.0.0.0/8`、`::1`）在用户态与 nft 白名单两侧都放行；未指定/多播源地址不会触发封禁（它们本身不是合法源地址，nft 仍会按扫描规则丢弃）。
 - IPv4-mapped IPv6（`::ffff:a.b.c.d`）会自动归一为 IPv4 处理，避免误写入 IPv6 黑名单却拦不住 IPv4 流量。
 - IPv6 默认**逐地址**封禁（`V6_AGG_PREFIXLEN = 128`），封谁就是谁，与 IPv4 封一个公网 IP 完全对称，不存在"连带封掉同网段别人"的问题。若确认面临"每包换一个源地址"的扫描压力，可以把 `V6_AGG_PREFIXLEN` 调到 `64` 开启聚合——代价是一次误判会波及整个前缀，详见 [`V6_AGG_PREFIXLEN`](#62-必须确认的配置项)。
 
@@ -166,7 +166,7 @@ venv/bin/pip install -r requirements.txt
 
 > ⚠️ 不要先建 venv 再 `mv`——activate 里的路径会写死旧位置。请直接在 `/root/port_scan_guard` 下建。
 
-`requests` 仅用于离线库未命中时的在线归属地查询，缺失时可正常运行（只是没有在线补充）。
+`requests` 仅用于离线库任一字段缺失时的在线归属地查询；未安装时可正常运行（只是没有在线补充）。在线查询在后台线程执行，不阻塞 nft 封禁与日志消费；查询成功时该条记录全部采用在线值（不与离线结果混用）；失败或限流后熔断 5 分钟，期间完全使用离线结果。查询失败、超时、429、返回 `status=fail` 或未安装 `requests` 时，记录仍会照常写入，只是归属地取离线值（缺失字段记为“未知”），该 IP 的离线结果会缓存 1 小时，期间不重复在线查询；`ONLINE_API` 置空可彻底关闭在线查询。ip-api 免费接口限 45 次/分钟，突发扫描容易触发限流并进入熔断。
 
 ---
 
@@ -191,7 +191,7 @@ chmod 600 *.xdb
 - `[!] IPv4 离线库未加载，将全部走在线查询`
 - `[!] IPv6 离线库未加载`
 
-建议优先准备好本地离线库：在线查询在高并发时时延、请求数都可能无法满足。
+建议优先准备好本地离线库：在线查询虽在后台执行，但离线字段大量缺失时会堆高记录队列；单次在线查询最坏 5 秒（DNS 解析另计），也更容易触发 ip-api 限流。
 
 ---
 
@@ -246,7 +246,9 @@ PRIVATE_NETS = [
 
 这五个网段**永远放行**：不写日志、不封禁，nft 里对应一条 `ip saddr @..._wl4 return`。所以局域网里其他机器扫你的端口不会被封——这是刻意的，否则 NAS 自己的容器网络、同网段设备一扫描就互相拉黑。
 
-要收紧（比如只想放行某个 `/24`）就直接改这个列表。注意这里用的是 `return` 而不是 `accept`：`return` 只结束本 chain 的处理，包继续按正常路径走，Docker 的 DNAT 端口映射不受影响；写成 `accept` 会跳过整个 PREROUTING hook，把映射打断。
+回环网段由固定常量 `LOOPBACK_NETS`（`127.0.0.0/8`、`::1/128`）提供，同样并入白名单 set：本机进程访问监测端口不会被拦截，也不会产生封禁记录。
+
+要收紧（比如只想放行某个 `/24`）就直接改 `PRIVATE_NETS`。注意这里用的是 `return` 而不是 `accept`：`return` 只结束本 chain 的处理，包继续按正常路径走，Docker 的 DNAT 端口映射不受影响；写成 `accept` 会跳过整个 PREROUTING hook，把映射打断。
 
 **`EXTRA_WHITELIST`**
 
@@ -374,7 +376,8 @@ nft 的规则语句顺序执行、任一 match 失败即中断整条规则，所
 | --- | --- |
 | 表名只含字母/数字/`_`/`.`/`-` | 含空格等字符会拼出非法 nft 语句 |
 | 前缀非空、不含 `"` 与换行、≤120 **字节**（UTF-8 编码后，中文 1 字 3 字节） | 前缀是直接拼进 `log prefix "..."` 的；实测 127 字节 nft 就报 `log prefix is too long` |
-| 两个前缀不相等、且不互为子串 | **这类错误 nft 不会报，只会静默失效**：所有扫描日志都被判成 ICMP 探测，端口扫描永不封禁 |
+| 两个前缀不相等，且 `ICMP_PROBE_PREFIX` 不是 `PORT_SCAN_PREFIX` 的子串 | **这类错误 nft 不会报，只会静默失效**：所有扫描日志都被判成 ICMP 探测，端口扫描永不封禁 |
+| `PRIVATE_NETS` / `LOOPBACK_NETS` / `EXTRA_WHITELIST` 的每个元素都是 `ip_network` 对象 | `_build_nft_config()` 需要访问 `.version`；写成字符串时启动校验直接报错并指出具体元素 |
 | 端口在 1~65535 内 | 越界值会写进 nft set，整表加载失败 |
 | 速率形如 `1/second`、`timeout` 带单位且数值 ≥ 1 | 实测 `timeout 60`（漏单位）直接语法错误，而 nft 的报错只给行号；`rate 0/second` 会被 nft 拒绝导致整表加载失败；`timeout 0s` 语法合法但实测含义是「无超时」——元素永不释放，配额 set 只增不减，满了该族新源就不写日志、不进黑名单，且启动无任何报错 |
 | `BAN_TIME` / `burst` 为正整数 | 拼进 `timeout 86400s` / `burst N`，非法值整表加载失败 |
@@ -431,7 +434,7 @@ sudo /root/port_scan_guard/venv/bin/python3 \
 关注点：
 
 - `[!] 离线库不存在` / `[!] IPv4 离线库未加载` → 检查 xdb 路径/权限；不影响封禁功能。
-- `[!] 日志流异常` / `[!] 日志流已中断` → 脚本会在 5 秒后自动重连。
+- `[!] 日志流异常` / `[!] 日志流已中断` → 脚本 5 秒后自动重连；连续 5 次异常或日志流打开后立即结束（如无权限、日志服务未运行），脚本退出并由 systemd 重启/告警，避免 `active` 状态下实际不封禁。
 - `黑名单容量` 显示的是**两侧同时装到上限**的最坏情况，不是启动即占用的内存：`size` 只声明上限、不预分配，实际水位几十到几百条时几乎不占。它的用处是出事时对账——`nft list set inet <表名> <表名>_bl4` 的元素数逼近这个数字，就该调容量或开 v6 聚合（见 [`SET4_MAXELEM`](#62-必须确认的配置项)）。紧跟的 `配额 set 容量` 同理，而且满载更隐蔽：只丢日志、不丢包，库里连痕迹都没有。
 - `日志配额: 每源 IP 1/second` 是**按源地址分桶**的：每个 IP 有自己的令牌桶，谁也挤不掉谁。配额给小不影响封禁——**封禁只需要 1 条日志**，burst 2 已足够触发；单个 IP 首秒最多 2 条、之后稳态 1 条/秒，日志量远低于命中即记。后面的 `100/second` 是**每条规则**的总量兜底（不区分来源 IP），防止海量 IP 各刷配额把内核日志打爆，同时也给 set 元素的创建速率封顶；实际天花板是"规则条数 × 100/s"，不是整机 100/s。调参见[日志配额](#62-必须确认的配置项)。
 - **ICMP 是否占配额 = 是否"真的会封禁"**，即 `ENABLE_ICMP_BAN=True` **且** `DRY_RUN=False`：
@@ -531,9 +534,11 @@ sudo journalctl -u port-scan-guard -f
 - ICMP 探测（`ENABLE_ICMP_BAN=True`）：`[时间] ban IP:ICMPv6 (国家/省/市/ISP) [来源]`，与端口扫描同一套 `ban` / `dry_run` / `ban_failed` 输出
 
 `result` 取值：`dry_run`（只记录）、`ban`（已封禁）、`ban_failed`（封禁失败）、`icmp_probe`（ICMP 仅记录）。`event_type` 为 `icmp` 时，`result` 可能是 `icmp_probe`（仅记录模式）或 `ban` / `dry_run`（封禁模式）。
-`来源` 取值：`offline`、`online`、`offline+online`、`unknown`。
+`来源` 取值：`offline`（整条来自离线库）、`online`（整条来自在线查询）、`unknown`（无可用归属地）。
 
 > 内核原始日志（nft log）在 `journalctl -k`，前缀为 `HOST_SCAN:` / `HOST_ICMP:`；服务日志则是脚本处理后的上面这种格式。
+
+> 归属地查询与写库在后台线程完成，nft 封禁和日志消费不等它，因此记录行可能比 `[!] nft ...` 警告稍晚出现。记录队列上限约 2 万条，打满后新记录降级为离线归属地立即写库；退出时最多等 10 秒把队列写完，超时会打印剩余条数后放弃。
 
 ### 9.2 检查是否误伤自己
 
@@ -616,7 +621,7 @@ sudo nft delete element inet port_scan_guard_host port_scan_guard_host_bl6 '{ <I
 
 - `event_type`：`port_scan`（端口扫描）/ `icmp`（ICMP 探测）。
 - `result`：`dry_run` / `ban` / `ban_failed` / `icmp_probe`。
-- `duration`：实际封禁秒数（`ban` 为 `BAN_TIME`）；`dry_run` 与 `icmp_probe` 均为 `0`。ICMP 封禁（`result=ban`）同样记 `BAN_TIME`。
+- `duration`：实际封禁秒数。`result=ban` 记 `BAN_TIME`（ICMP 封禁同样）；`dry_run`、`ban_failed`、`icmp_probe` 均记 `0`。
 - ICMP 记录的 `port` 为 `NULL`（两种模式都是）。
 - 同一 IP 已在黑名单中时**不会重复写库**（既不续期也不再记录），因此单个攻击者 24 小时内最多留下一条 `ban` 记录。
 
@@ -731,7 +736,7 @@ sudo systemctl restart port-scan-guard
 | Docker 映射端口连不上 | 链里有 `accept`（应为 `return`） | `nft list chain inet port_scan_guard_host prerouting \| grep wl4` |
 | `protocol` 全为 NULL | 数据库里的历史记录（写入时未解析协议） | 当前脚本正常不会产生 NULL，确认 `PORT_SCAN_RE` 里 `PROTO` 在 `DPT` 之前 |
 | `scan.db` 增长太快 | 被持续扫描 + 去重窗口小 | 调大 `BAN_DEDUP_WINDOW`，或暂时保持 `DRY_RUN=True` |
-| 服务反复退出/重启 | nft 配置错误或权限不足（`setup_firewall` 失败会退出） | `journalctl -u port-scan-guard -n 100 --no-pager` |
+| 服务反复退出/重启 | nft 配置错误、权限不足，或连续 5 次拿不到内核日志源（`setup_firewall` / 日志源失败都会退出） | `journalctl -u port-scan-guard -n 100 --no-pager` |
 | 启动时报 `conntrack` 相关错误 | 内核缺 `nf_conntrack` | 设 `UDP_NEW_CONN_ONLY=False`、`ENABLE_FLAG_SCAN=False`，或 `modprobe nf_conntrack` |
 | 启动报 `update ... syntax error` | nft < 1.0.6，不支持 dynamic set | 升级 nftables 到 ≥ 1.0.6 |
 | 某个来源的扫描没被封 | 该 IP 配额在窗口内已用尽（首秒只记前 2 个，之后每秒 1 个） | 属预期：封禁只需 1 条日志；要留更多证据就调大 `LOG_QUOTA_BURST` |
@@ -830,6 +835,8 @@ sudo rm -rf /root/port_scan_guard
 ```
 
 只临时停服保留配置：`systemctl stop` 即可。默认 `DESTROY_TABLE_ON_EXIT = False`，停服后 nft 表和黑名单元素保留，但 `prerouting` 链规则被 flush——停服期间不拦截。
+
+> 清理只发生在主动停服（SIGTERM/SIGINT）。进程异常崩溃时 `atexit` 保留 nft 规则不 flush（fail-closed），监测端口的既有防护不中断；恢复由 systemd 重启完成。
 
 ---
 
