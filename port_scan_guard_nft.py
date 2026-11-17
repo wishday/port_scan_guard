@@ -240,9 +240,51 @@ DRY_RUN    = False
 # True  = 停服即全部解封，重启后从零开始。
 DESTROY_TABLE_ON_EXIT = False
 
-# nft set 最大容量
-SET4_MAXELEM = 1048576
-SET6_MAXELEM = 262144
+# nft set 最大容量（黑名单 set）
+# ★ 实测每元素约 200 字节（v4 196B / v6 214B，带 timeout 扩展），
+#   且 size 只是**上限、不预分配**：空 set 无论 size 多大都占 0 内存，
+#   代价只在真的装到那个数量时产生。所以这是"安全边界"而非日常水位。
+#   推满的内存：v4/v6 各 524288 → 98MB + 107MB ≈ 205MB（两侧统一取 2^19）。
+#
+# ★ 两侧都取 524288 是权衡结果，不是各自的最优值：
+#   - v4 原本 1048576（满表 196MB）。v4 没有聚合选项（聚合到 /24 会误封同
+#     C 段邻居），容量是唯一抗灌手段，所以从抗灌角度 1M 更好。但实际水位是
+#     几十到几百条，524288 仍有千倍以上余量；降一半只把"理论灌满时间"从
+#     ~2.9 小时缩短到 ~1.5 小时（按 100 封禁/s 上限估），而 size 不预分配，
+#     降它省不到任何日常内存 —— 纯粹是为了两侧数值统一。
+#   - v6 原本 262144（满表 54MB）。加容量的收益很低：v6 攻击者换源零成本
+#     （一个 /64 就有 2^64 个地址），灌满速度受**封禁速率**限制而非容量，
+#     翻倍只是把漏封起点往后推一倍。真正有效的做法是 V6_AGG_PREFIXLEN < 128。
+#   若内存紧张，正确方向是开启聚合 + 把 v6 降到 65536，而不是继续加容量。
+SET4_MAXELEM = 524288
+SET6_MAXELEM = 524288
+
+# IPv6 封禁 / 日志配额的聚合前缀长度。128 = 不聚合（逐地址封禁，默认）；
+# 小于 128 时，同一前缀内的所有地址共用一个黑名单槽位、一个配额桶。
+#
+# ★ 默认取 128 的理由（优先避免误封）：
+#   - 语义与 IPv4 完全对称：封一个 IPv6 地址就是封一个地址，不会牵连别人。
+#   - "一个 /64 = 一个用户"并不总成立。共享 /64 的现实场景：
+#       云主机子网（AWS VPC 拿 /56，每个子网 /64，同子网多台实例共用）、
+#       PPPoE 接入侧共享链路前缀、公共 WiFi、校园网、企业 NAT 出口。
+#     这些位置按 /64 聚合会把大量无关用户一起挡在门外。
+#   - 家宽 NAS 面对的入站扫描规模有限，逐地址封禁的容量通常够用。
+#
+# ★ 什么时候该改成 64（或 56）：
+#   日志里若出现"同一 /64 内每包换一个源地址"的扫描（IPv6 换源零成本），
+#   逐地址封禁会被灌满黑名单 —— 524288 槽在 100 封禁/s 下约 87 分钟耗尽，
+#   之后新地址一律封不住。此时按 /64 聚合能把换源门槛从"单机随意伪造"
+#   抬到"要掌握几万个不同子网"，与 IPv4 僵尸网络同一量级。
+#
+# ★ 聚合的语义变化（仅 <128 时生效）：封禁单位从"单个地址"变成"整个
+#   网段"，一次误判会波及同前缀的其他设备。白名单按网段匹配（interval
+#   set），不受聚合影响。
+#
+# ★ 掩码必须是 `ffff:ffff:ffff:ffff::`（保留高 64 位、清零低 64 位）。
+#   写成 `::ffff:ffff:ffff:ffff` 是保留低 64 位（接口标识），毫无聚合效果：
+#   实测 3 个同 /64 源分别产生 3 个元素 `::a1 / ::a2 / ::a3`，而正确掩码
+#   只产生 1 个 `2001:db8:77::`。
+V6_AGG_PREFIXLEN = 128
 
 # nft 表名（inet 族，与 Docker 的 ip/ip6 族隔离）
 NFT_TABLE = "port_scan_guard_host"
@@ -285,21 +327,28 @@ USE_LOG_QUOTA      = True
 LOG_QUOTA_RATE     = "1/second"    # 每个源 IP 的日志配额
 LOG_QUOTA_BURST    = 2
 LOG_QUOTA_TIMEOUT  = "60s"         # 元素空闲多久释放（update 会刷新）
-# set 容量上限。每元素百字节量级，65536 约几 MB。
+# set 容量上限。每元素约 200 字节（实测），65536 满表约 13MB。
+# ★ 容量要按"该族所有 log 规则的兜底速率之和"估算，不能按单条算：
+#   每条规则都有自己的 `limit rate 100/second` 兜底，而 IPv4 / IPv6 各有
+#   4 条扫描规则（TCP SYN / FIN / NULL + UDP；开 ICMP 封禁时再各 +1）。
+#   稳态元素数上限 ≈ 规则数 × 100/s × LOG_QUOTA_TIMEOUT(60s)
+#                    = 4 × 100 × 60 ≈ 24000（开 ICMP 封禁约 30000）。
+#   因此 v6 侧原本的 16384 在这种极端情况下会被填满（填满即漏封），
+#   已与 v4 对齐到 65536，留 2 倍以上余量。
+# ★ 默认 V6_AGG_PREFIXLEN = 128（逐地址）时按"地址数"算；若改成按 /64
+#   聚合，一个元素代表一整个前缀，元素数成数量级下降，容量更宽松。
 # ★ set 满后的行为**不是"跳过配额、继续 log"**（实测，nft 1.0.9）：
 #   `update` 失败会中断整条规则，后面的 `limit` 与 `log` 都不执行。
 #   即：该协议族下**新出现的源 IP 完全不写日志、不进黑名单**，直到有元素
 #   超时释放；已在 set 里的 IP 不受影响（元素存在时 update 只刷新，不占新槽）。
 #   drop 是独立规则，照常丢包 —— 所以是"漏封"，不是"漏拦"。
-# ★ 正常情况下不会被填满：每规则兜底 limit 已排在 update 之前（见
-#   _emit_log_rule 的 ★★ 说明），元素创建速率被限制在 LOG_GLOBAL_RATE
-#   （100/s）以内，稳态元素数 ≈ 100/s × LOG_QUOTA_TIMEOUT(60s) ≈ 6000，
-#   对下面的 65536 / 16384 有 10 倍以上余量。这里的容量是极端情况下的
-#   安全边界，不是日常水位。
+# ★ 正常流量远达不到这个上限：兜底 limit 已排在 update 之前（见
+#   _emit_log_rule 的 ★★ 说明），元素创建速率被压在 LOG_GLOBAL_RATE 以内。
+#   这里的容量是极端情况下的安全边界，不是日常水位。
 #   真遇到容量告警才需要动它：调小 LOG_QUOTA_TIMEOUT（元素只需覆盖
 #   "首包 → 写入黑名单"的几秒窗口），或调大本容量。
 LOG_QUOTA_SET4_MAXELEM = 65536
-LOG_QUOTA_SET6_MAXELEM = 16384
+LOG_QUOTA_SET6_MAXELEM = 65536
 
 # 每条 log 规则的总量兜底（仅 USE_LOG_QUOTA = True 时生效）：在 per-IP 配额
 # 之上再压一道**不区分来源 IP** 的上限，防止"大量 IP 各刷自己的配额"
@@ -626,10 +675,32 @@ def _validate_config():
         if not isinstance(HASHLIMIT_BURST, int) or HASHLIMIT_BURST < 1:
             errs.append(f"HASHLIMIT_BURST={HASHLIMIT_BURST!r} 必须是 >= 1 的整数")
 
+    # ---- 黑名单 set 容量 ----
+    # ★ 与 USE_LOG_QUOTA 无关：bl4/bl6 是无条件生成的黑名单 set，任何模式下
+    #   都会用到这两个值，所以放在 if 分支外面校验。
+    # ★ 同 size 的坑：写 0 时 nft 报的是后面那行的 "unexpected '}'"。
+    for name, v in (("SET4_MAXELEM", SET4_MAXELEM),
+                    ("SET6_MAXELEM", SET6_MAXELEM)):
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            errs.append(f"{name}={v!r} 必须是 >= 1 的整数"
+                        f"（nft 的 size 写 0/负数只会报一条指向别处的"
+                        f"语法错，很难定位）")
+
     # ---- 封禁时长 ----
     if not isinstance(BAN_TIME, int) or isinstance(BAN_TIME, bool) \
             or BAN_TIME < 1:
         errs.append(f"BAN_TIME={BAN_TIME!r} 必须是 >= 1 的整数（秒）")
+
+    # ---- IPv6 聚合前缀 ----
+    # ★ 越界会让 _v6_mask() 抛异常（/129 之类），或算出全 0 掩码把整个
+    #   IPv6 空间并成一个 key —— 一次误判就封掉全部 v6，必须前置拦。
+    # ★ 下限取 32（而不是 1）：/32 已经是一个运营商级前缀，比它更粗的取值
+    #   在防护上没有意义，只会把海量无关地址并进同一个封禁槽位。
+    if not isinstance(V6_AGG_PREFIXLEN, int) \
+            or isinstance(V6_AGG_PREFIXLEN, bool) \
+            or not (32 <= V6_AGG_PREFIXLEN <= 128):
+        errs.append(f"V6_AGG_PREFIXLEN={V6_AGG_PREFIXLEN!r} 必须是 32~128 的"
+                    f"整数（128 = 逐地址，默认；64 = 按 /64 聚合）")
 
     # ---- 开关组合 ----
     # ★ ENABLE_ICMP_BAN=True + ENABLE_ICMP_LOG=False 只告警不退出：
@@ -674,9 +745,14 @@ def _build_nft_config():
 
     # ★ inet 族里 `ip saddr` 对 IPv6 包不成立，因此 per-IP 配额必须
     #   按协议族拆成两条规则；不拆的话 IPv6 流量完全没有配额。
+    # ★ IPv6 的 key 在聚合时才带 `& <mask>`（按 V6_AGG_PREFIXLEN 聚合，
+    #   同前缀的所有源共用一个令牌桶）；默认 128 不聚合，key 与 v4 对称，
+    #   直接是 `ip6 saddr`。理由见该常量处的说明。
+    _k6 = "ip6 saddr" if V6_AGG_PREFIXLEN >= 128 \
+        else f"ip6 saddr & {_v6_mask()}"
     FAMILIES = (
         ("ip",  "meta nfproto ipv4", f"{NFT_TABLE}_lq4", "ip saddr"),
-        ("ip6", "meta nfproto ipv6", f"{NFT_TABLE}_lq6", "ip6 saddr"),
+        ("ip6", "meta nfproto ipv6", f"{NFT_TABLE}_lq6", _k6),
     )
 
     L = []
@@ -772,13 +848,15 @@ def _build_nft_config():
         ★★ 兜底 limit 必须排在 update **之前**（实测 nft 1.0.9）：
           - 若写成 `update @set {...} limit 100/second log`，被兜底丢掉的包
             也已经执行过 update，**照样在 set 里占一个槽**。攻击者用大量
-            不同源地址发包即可无上限地灌 set（1000 pps 随机源：IPv6 的
-            16384 槽约 16 秒、IPv4 的 65536 槽约 65 秒填满），随后该族
-            `update` 恒失败 → 整条规则中断 → 新源 IP 完全不写日志、不被封。
+            不同源地址发包即可无上限地灌 set（1000 pps 随机源：65536 槽
+            约 65 秒填满），随后该族 `update` 恒失败 → 整条规则中断 →
+            新源 IP 完全不写日志、不被封。
             LOG_GLOBAL_RATE 完全保护不到 set，这正是它本该保护的东西。
-          - 前置后，元素创建速率被限制在 LOG_GLOBAL_RATE 以内，稳态元素数
-            ≈ 100/s × LOG_QUOTA_TIMEOUT(60s) ≈ 6000，对 65536 / 16384 的
-            容量都有 10 倍以上余量，正常运行不会被填满。
+          - 前置后，单个包必须先过兜底限速才可能创建元素，创建速率被压在
+            LOG_GLOBAL_RATE 以内。注意速率是**按规则累加**的：每个族有 4 条
+            扫描规则（TCP SYN/FIN/NULL + UDP），稳态元素数上限
+            ≈ 4 × 100/s × LOG_QUOTA_TIMEOUT(60s) ≈ 24000，对 65536 的容量
+            有 2 倍以上余量，正常运行不会被填满。
           - 实测前置顺序合法，且 per-IP 配额行为不变：兜底 5/s burst 5 前置，
             连发 20 包，per-IP 仍只放行 burst 2 个，元素正常创建、timeout
             正常刷新。
@@ -804,12 +882,13 @@ def _build_nft_config():
             L.append(f"        {head}{match} {glob}{quota_stmt}{tail}")
 
     # 黑名单（跟随 DRY_RUN）
+    # ★ IPv6 侧同样要带掩码，与 ban() 写入的归一地址保持同一坐标系。
     bl_rule = f"ip  saddr @{NFT_TABLE}_bl4 counter"
     if bl_verdict:
         bl_rule += f" {bl_verdict}"
     L.append(f"        {bl_rule}")
 
-    bl_rule6 = f"ip6 saddr @{NFT_TABLE}_bl6 counter"
+    bl_rule6 = f"{_k6} @{NFT_TABLE}_bl6 counter"
     if bl_verdict:
         bl_rule6 += f" {bl_verdict}"
     L.append(f"        {bl_rule6}")
@@ -962,17 +1041,50 @@ def setup_firewall():
                     continue
                 if t > BAN_TIME:
                     t = BAN_TIME
+                # ★ 从旧版本升级时，旧 bl6 里可能是当时粒度下的完整地址；
+                #   新表的匹配若带掩码（V6_AGG_PREFIXLEN < 128），必须归一后
+                #   再写，否则这些元素躺在表里但永远匹配不到 —— 封禁静默
+                #   失效且不报错。默认 128 时归一等于原样，走同一路径无害。
+                if setname.endswith("_bl6"):
+                    try:
+                        ip = _v6_net_key(ipaddress.ip_address(ip))
+                    except ValueError:
+                        continue
                 lines.append(
                     f"add element inet {NFT_TABLE} {setname} "
                     f"{{ {ip} timeout {int(t)}s }}")
         if not lines:
             return 0
-        r = _nft_load("\n".join(lines) + "\n")
-        if r.returncode != 0:
-            print(f"[!] 恢复封禁记录失败（表 inet {NFT_TABLE}）: "
-                  f"{r.stderr.strip()}", flush=True)
-            return 0
-        return len(lines)
+
+        # ★ 分批加载，不要一次性 batch。实测 set 满时 `nft -f` 会返回 ENFILE
+        #   并中断整个脚本 —— 一次性提交等于"一条写不进去，全部封禁一起丢"。
+        #   分批后超容量的只影响后面的批次，前面已写入的照常生效，把
+        #   "全丢"降级成"丢尾部"，也避免超大脚本单次加载的耗时与内存峰值。
+        _BATCH = 10000
+        restored = 0
+        lost = 0
+        first_err = ""
+        for i in range(0, len(lines), _BATCH):
+            chunk = lines[i:i + _BATCH]
+            r = _nft_load("\n".join(chunk) + "\n")
+            if r.returncode == 0:
+                restored += len(chunk)
+            else:
+                lost += len(chunk)
+                if not first_err:
+                    first_err = (r.stderr or "").strip()
+        if lost:
+            hint = ""
+            # ★ set 满时报的是 ENFILE 文案，极易被误当成 fd 耗尽。
+            if "Too many open files" in first_err:
+                hint = (f"（这是 set 满的报错，不是 fd 耗尽：容量 "
+                        f"SET4={SET4_MAXELEM} / SET6={SET6_MAXELEM}。"
+                        f"旧表已删除，失败那批元素无法自动补回；"
+                        f"确需恢复请调大容量后按 bans 表手工重封）")
+            print(f"[!] 恢复封禁记录部分失败：成功 {restored} 条 / 失败 {lost} 条"
+                  f"（共 {len(lines)} 条，表 inet {NFT_TABLE}）: {first_err}{hint}",
+                  flush=True)
+        return restored
 
     restored = _restore(
         [(f"{NFT_TABLE}_bl4", old_v4), (f"{NFT_TABLE}_bl6", old_v6)])
@@ -1381,6 +1493,30 @@ def _normalize_ip(ip: str):
     return str(addr), addr
 
 
+def _v6_mask() -> str:
+    """V6_AGG_PREFIXLEN 对应的位与常量，如 /64 → 'ffff:ffff:ffff:ffff::'。
+
+    用于 nft 表达式 `ip6 saddr & <mask>`。注意方向：这个常量保留**高**
+    prefixlen 位、清零低位，才是"按前缀聚合"；反过来（如
+    ::ffff:ffff:ffff:ffff）保留的是接口标识，实测完全没有聚合效果。
+    """
+    return str(ipaddress.ip_network(f"::/{V6_AGG_PREFIXLEN}").netmask)
+
+
+def _v6_net_key(addr) -> str:
+    """把 IPv6 地址归一到聚合前缀的网络地址，返回字符串。
+
+    ★ 聚合时（V6_AGG_PREFIXLEN < 128）必须归一才能写进 set：nft 侧匹配
+      写成 `ip6 saddr & <mask> @bl6`，查询时先用掩码处理包的源地址再查表。
+      若表里存的是未归一的完整地址（例如改过一次粒度后留下的旧元素），
+      掩码后永远查不到 —— 封禁记录在表里躺着，流量却照过，且不报任何错。
+
+    V6_AGG_PREFIXLEN=128（默认）时返回原地址，等价于不聚合。
+    """
+    net = ipaddress.ip_network(f"{addr}/{V6_AGG_PREFIXLEN}", strict=False)
+    return str(net.network_address)
+
+
 def _warn_table_lost():
     """nft 表被外部删除时打一条醒目告警（10 分钟内只打一次）。
 
@@ -1427,7 +1563,14 @@ def ban(ip: str, port: int = None, protocol: str = None,
     setname = f"{NFT_TABLE}_bl6" if is_v6 else f"{NFT_TABLE}_bl4"
     family = "ipv6" if is_v6 else "ipv4"
 
-    skip = _should_skip_dedup(ip, kind)
+    # ★ 开启聚合时（V6_AGG_PREFIXLEN < 128），set 里写入的是归一后的前缀
+    #   网络地址；默认 128 时归一等于原样，set 里就是完整地址，与 v4 对称。
+    #   去重也用它：聚合时同一前缀内的不同源地址共用一个封禁槽位，若按原始
+    #   地址去重会在窗口期过后反复 get/add 同一个元素、反复写库。
+    #   数据库与日志仍保留**原始触发地址**，便于审计"具体是谁扫的"。
+    set_key = _v6_net_key(addr) if is_v6 else ip
+
+    skip = _should_skip_dedup(set_key, kind)
 
     if DRY_RUN:
         # DRY_RUN 下也走去重，避免日志狂刷时把库写爆
@@ -1443,17 +1586,18 @@ def ban(ip: str, port: int = None, protocol: str = None,
         #   否则持续扫描者每 10 秒（去重窗口）就会把 timeout 重置为 BAN_TIME
         #   → 实际成为永久封禁（与"24 小时"的语义不符），
         #     且单 IP 每天往库里写 8640 行。
-        r = _nft(["get", "element", "inet", NFT_TABLE, setname, f"{{ {ip} }}"])
+        r = _nft(["get", "element", "inet", NFT_TABLE, setname,
+                  f"{{ {set_key} }}"])
         if r.returncode == 0:
             return
 
         r = _nft(["add", "element", "inet", NFT_TABLE, setname,
-                  f"{{ {ip} timeout {BAN_TIME}s }}"])
+                  f"{{ {set_key} timeout {BAN_TIME}s }}"])
         if r.returncode == 0:
             result = "ban"
         else:
             result = "ban_failed"
-            print(f"[!] nft 添加元素失败 {ip}"
+            print(f"[!] nft 添加元素失败 {set_key}"
                   f"（inet {NFT_TABLE} / {setname}）: {r.stderr.strip()}",
                   flush=True)
             # ★ "No such file or directory" 通常不是元素本身的问题，而是
@@ -1462,6 +1606,17 @@ def ban(ip: str, port: int = None, protocol: str = None,
             #   完全没有防护，而脚本只会不停打 ban_failed —— 必须显式喊出来。
             if "No such file or directory" in (r.stderr or ""):
                 _warn_table_lost()
+            # ★ "Too many open files in system"（ENFILE）实测是 **set 满** 的
+            #   文案，和 fd 耗尽毫无关系。不点破的话运维第一反应是去查
+            #   ulimit -n，方向完全跑偏。
+            elif "Too many open files" in (r.stderr or ""):
+                cap = SET6_MAXELEM if is_v6 else SET4_MAXELEM
+                print(f"[!] 上一条不是 fd 耗尽，是黑名单 set 已满"
+                      f"（{setname} 容量 {cap}）。新来源将不再被封禁，"
+                      f"已封的仍按剩余时间过期释放。扩容：调大 "
+                      f"{'SET6' if is_v6 else 'SET4'}_MAXELEM 后重启，"
+                      f"或临时 nft flush set inet {NFT_TABLE} {setname}",
+                      flush=True)
 
     info = get_ip_info(ip)
 
@@ -1494,8 +1649,17 @@ def ban(ip: str, port: int = None, protocol: str = None,
     elif protocol:
         tag = f":{protocol}"
 
+    # ★ 聚合封禁时（V6_AGG_PREFIXLEN < 128），日志要把"封禁范围"和"触发
+    #   地址"都写出来，否则看到 2001:db8:77::/64 会以为是别人触发的。
+    #   默认 128 时 set_key 就是原始地址，不必再缀 /128。
+    if is_v6 and V6_AGG_PREFIXLEN < 128:
+        shown = f"{set_key}/{V6_AGG_PREFIXLEN}"
+    else:
+        shown = ip
+    trig = f" (触发 {ip})" if is_v6 and set_key != ip else ""
+
     print(
-        f"[{time.strftime('%F %T')}] {result} {ip}{tag} "
+        f"[{time.strftime('%F %T')}] {result} {shown}{tag}{trig} "
         f"({info['country']}/{info['province']}/{info['city']}/{info['isp']}) "
         f"[{info['source']}]",
         flush=True,
@@ -1780,6 +1944,22 @@ def main():
           f"在 Docker DNAT 之前）", flush=True)
     print(f"[*] 策略：内网 IPv4/IPv6 放行，"
           f"命中端口即封 {BAN_TIME}s", flush=True)
+    # ★ 容量是部署时要盯的数字：黑名单满之后**新源封不进去**（漏封，且日志
+    #   里只会看到 ENFILE 那句误导性报错），配额 set 满之后该族不写日志（漏记）。
+    #   每元素字节数取实测值（带 timeout 扩展）：196B / 214B。size 只是上限、
+    #   不预分配，所以日常内存远低于这里的满表估值，不必因数字大而调小。
+    _mib4 = SET4_MAXELEM * 196 // (1024 * 1024)
+    _mib6 = SET6_MAXELEM * 214 // (1024 * 1024)
+    print(f"[*] 黑名单容量：IPv4 {SET4_MAXELEM} / IPv6 {SET6_MAXELEM} 条"
+          f"（满表约 {_mib4}MB + {_mib6}MB，不预分配）", flush=True)
+    # ★ IPv6 的封禁粒度直接来自配置，启动时自证一遍：运维看到实际粒度，
+    #   才会意识到"聚合时一次误判会波及整个前缀"。
+    if V6_AGG_PREFIXLEN >= 128:
+        print("[*] IPv6 封禁：逐地址（V6_AGG_PREFIXLEN = 128，未聚合）",
+              flush=True)
+    else:
+        print(f"[*] IPv6 封禁：按 /{V6_AGG_PREFIXLEN} 聚合，"
+              f"同一前缀共用一个封禁槽位与配额桶", flush=True)
     if not ENABLE_ICMP_LOG:
         print("[*] ICMP：未启用（ENABLE_ICMP_LOG = False）", flush=True)
         if ENABLE_ICMP_BAN:
@@ -1813,6 +1993,11 @@ def main():
         print(f"[*] 日志配额: 每源 IP {LOG_QUOTA_RATE} / burst "
               f"{LOG_QUOTA_BURST}；每规则兜底 {LOG_GLOBAL_RATE}"
               f"（仅影响 log，不影响 drop）", flush=True)
+        # 配额 set 是每族一个（v4/v6 各一个，族内各规则共用），满了之后
+        # 该族新源一律不写日志——比黑名单满更隐蔽，值得单独打出来。
+        print(f"[*] 配额 set 容量：IPv4 {LOG_QUOTA_SET4_MAXELEM} / "
+              f"IPv6 {LOG_QUOTA_SET6_MAXELEM} 条/族"
+              f"（满了该族新源不再写日志）", flush=True)
     elif USE_HASHLIMIT:
         print(f"[!] 日志限速: {HASHLIMIT_RATE} / burst {HASHLIMIT_BURST}"
               f"，不区分来源 IP：单个 IP 打满即让其他来源不写日志",
