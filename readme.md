@@ -166,7 +166,7 @@ venv/bin/pip install -r requirements.txt
 
 > ⚠️ 不要先建 venv 再 `mv`——activate 里的路径会写死旧位置。请直接在 `/root/port_scan_guard` 下建。
 
-`requests` 仅用于离线库未命中时的在线归属地查询，缺失时可正常运行（只是没有在线补充）。
+`requests` 仅用于离线库缺失国家或 ISP 时的在线补充；未安装时可正常运行（只是没有在线补充）。在线查询失败或限流后熔断 5 分钟，期间完全使用离线结果；`ONLINE_API` 置空可彻底关闭在线查询。
 
 ---
 

@@ -400,13 +400,14 @@ DB_PATH        = "/root/port_scan_guard/scan.db"
 XDB_V4         = "/root/port_scan_guard/ip2region_v4.xdb"
 XDB_V6         = "/root/port_scan_guard/ip2region_v6.xdb"
 
-# 在线归属地查询（仅当离线库未命中时使用）
+# 在线归属地查询（离线库缺失国家或 ISP 时触发；已有国家+ISP 时不查询）
 # ★ ip-api.com 免费版只提供明文 HTTP（无 HTTPS），且会暴露查询的 IP；
 #   介意的话把 ONLINE_API 置空字符串（""）即可完全关闭在线查询。
 ONLINE_API     = ("http://ip-api.com/json/{ip}"
-                  "?lang=zh-CN&fields=status,country,regionName,city,isp")
+                  "?lang=zh-CN&fields=status,message,"
+                  "country,regionName,city,isp")
 # ★ 用 (connect, read) 元组，避免单值 5 被解释为"各 5 秒"最坏 10 秒；
-#   最坏总耗时 5 秒，远离 STOP_GRACE=8 的强制杀死边界
+#   连接/读取最坏共 5 秒。DNS 解析不受此参数约束，由系统 resolver 控制。
 ONLINE_TIMEOUT = (2, 3)
 # 在线查询失败后的熔断时长（秒）：期间不再发起请求，避免封禁路径被拖慢
 ONLINE_FAIL_BACKOFF = 300
