@@ -246,7 +246,9 @@ PRIVATE_NETS = [
 
 这五个网段**永远放行**：不写日志、不封禁，nft 里对应一条 `ip saddr @..._wl4 return`。所以局域网里其他机器扫你的端口不会被封——这是刻意的，否则 NAS 自己的容器网络、同网段设备一扫描就互相拉黑。
 
-要收紧（比如只想放行某个 `/24`）就直接改这个列表。注意这里用的是 `return` 而不是 `accept`：`return` 只结束本 chain 的处理，包继续按正常路径走，Docker 的 DNAT 端口映射不受影响；写成 `accept` 会跳过整个 PREROUTING hook，把映射打断。
+回环网段由固定常量 `LOOPBACK_NETS`（`127.0.0.0/8`、`::1/128`）提供，同样并入白名单 set：本机进程访问监测端口不会被拦截，也不会产生封禁记录。
+
+要收紧（比如只想放行某个 `/24`）就直接改 `PRIVATE_NETS`。注意这里用的是 `return` 而不是 `accept`：`return` 只结束本 chain 的处理，包继续按正常路径走，Docker 的 DNAT 端口映射不受影响；写成 `accept` 会跳过整个 PREROUTING hook，把映射打断。
 
 **`EXTRA_WHITELIST`**
 
@@ -375,7 +377,7 @@ nft 的规则语句顺序执行、任一 match 失败即中断整条规则，所
 | 表名只含字母/数字/`_`/`.`/`-` | 含空格等字符会拼出非法 nft 语句 |
 | 前缀非空、不含 `"` 与换行、≤120 **字节**（UTF-8 编码后，中文 1 字 3 字节） | 前缀是直接拼进 `log prefix "..."` 的；实测 127 字节 nft 就报 `log prefix is too long` |
 | 两个前缀不相等，且 `ICMP_PROBE_PREFIX` 不是 `PORT_SCAN_PREFIX` 的子串 | **这类错误 nft 不会报，只会静默失效**：所有扫描日志都被判成 ICMP 探测，端口扫描永不封禁 |
-| `PRIVATE_NETS` / `LOOPBACK_NETS` / `EXTRA_WHITELIST` 的每个元素都是 `ip_network` 对象 | 误写成字符串时 `_build_nft_config()` 访问 `.version` 会抛 `AttributeError`，报错信息与配置项完全对不上 |
+| `PRIVATE_NETS` / `LOOPBACK_NETS` / `EXTRA_WHITELIST` 的每个元素都是 `ip_network` 对象 | `_build_nft_config()` 需要访问 `.version`；写成字符串时启动校验直接报错并指出具体元素 |
 | 端口在 1~65535 内 | 越界值会写进 nft set，整表加载失败 |
 | 速率形如 `1/second`、`timeout` 带单位且数值 ≥ 1 | 实测 `timeout 60`（漏单位）直接语法错误，而 nft 的报错只给行号；`rate 0/second` 会被 nft 拒绝导致整表加载失败；`timeout 0s` 语法合法但实测含义是「无超时」——元素永不释放，配额 set 只增不减，满了该族新源就不写日志、不进黑名单，且启动无任何报错 |
 | `BAN_TIME` / `burst` 为正整数 | 拼进 `timeout 86400s` / `burst N`，非法值整表加载失败 |
@@ -432,7 +434,7 @@ sudo /root/port_scan_guard/venv/bin/python3 \
 关注点：
 
 - `[!] 离线库不存在` / `[!] IPv4 离线库未加载` → 检查 xdb 路径/权限；不影响封禁功能。
-- `[!] 日志流异常` / `[!] 日志流已中断` → 脚本会在 5 秒后自动重连。
+- `[!] 日志流异常` / `[!] 日志流已中断` → 脚本 5 秒后自动重连；连续 5 次异常或日志流打开后立即结束（如无权限、日志服务未运行），脚本退出并由 systemd 重启/告警，避免 `active` 状态下实际不封禁。
 - `黑名单容量` 显示的是**两侧同时装到上限**的最坏情况，不是启动即占用的内存：`size` 只声明上限、不预分配，实际水位几十到几百条时几乎不占。它的用处是出事时对账——`nft list set inet <表名> <表名>_bl4` 的元素数逼近这个数字，就该调容量或开 v6 聚合（见 [`SET4_MAXELEM`](#62-必须确认的配置项)）。紧跟的 `配额 set 容量` 同理，而且满载更隐蔽：只丢日志、不丢包，库里连痕迹都没有。
 - `日志配额: 每源 IP 1/second` 是**按源地址分桶**的：每个 IP 有自己的令牌桶，谁也挤不掉谁。配额给小不影响封禁——**封禁只需要 1 条日志**，burst 2 已足够触发；单个 IP 首秒最多 2 条、之后稳态 1 条/秒，日志量远低于命中即记。后面的 `100/second` 是**每条规则**的总量兜底（不区分来源 IP），防止海量 IP 各刷配额把内核日志打爆，同时也给 set 元素的创建速率封顶；实际天花板是"规则条数 × 100/s"，不是整机 100/s。调参见[日志配额](#62-必须确认的配置项)。
 - **ICMP 是否占配额 = 是否"真的会封禁"**，即 `ENABLE_ICMP_BAN=True` **且** `DRY_RUN=False`：
@@ -617,7 +619,7 @@ sudo nft delete element inet port_scan_guard_host port_scan_guard_host_bl6 '{ <I
 
 - `event_type`：`port_scan`（端口扫描）/ `icmp`（ICMP 探测）。
 - `result`：`dry_run` / `ban` / `ban_failed` / `icmp_probe`。
-- `duration`：实际封禁秒数（`ban` 为 `BAN_TIME`）；`dry_run`、`ban_failed` 与 `icmp_probe` 均为 `0`（后两者没有真正生效，记 0 避免统计被高估）。ICMP 封禁（`result=ban`）同样记 `BAN_TIME`。
+- `duration`：实际封禁秒数。`result=ban` 记 `BAN_TIME`（ICMP 封禁同样）；`dry_run`、`ban_failed`、`icmp_probe` 均记 `0`。
 - ICMP 记录的 `port` 为 `NULL`（两种模式都是）。
 - 同一 IP 已在黑名单中时**不会重复写库**（既不续期也不再记录），因此单个攻击者 24 小时内最多留下一条 `ban` 记录。
 
@@ -732,7 +734,7 @@ sudo systemctl restart port-scan-guard
 | Docker 映射端口连不上 | 链里有 `accept`（应为 `return`） | `nft list chain inet port_scan_guard_host prerouting \| grep wl4` |
 | `protocol` 全为 NULL | 数据库里的历史记录（写入时未解析协议） | 当前脚本正常不会产生 NULL，确认 `PORT_SCAN_RE` 里 `PROTO` 在 `DPT` 之前 |
 | `scan.db` 增长太快 | 被持续扫描 + 去重窗口小 | 调大 `BAN_DEDUP_WINDOW`，或暂时保持 `DRY_RUN=True` |
-| 服务反复退出/重启 | nft 配置错误或权限不足（`setup_firewall` 失败会退出） | `journalctl -u port-scan-guard -n 100 --no-pager` |
+| 服务反复退出/重启 | nft 配置错误、权限不足，或连续 5 次拿不到内核日志源（`setup_firewall` / 日志源失败都会退出） | `journalctl -u port-scan-guard -n 100 --no-pager` |
 | 启动时报 `conntrack` 相关错误 | 内核缺 `nf_conntrack` | 设 `UDP_NEW_CONN_ONLY=False`、`ENABLE_FLAG_SCAN=False`，或 `modprobe nf_conntrack` |
 | 启动报 `update ... syntax error` | nft < 1.0.6，不支持 dynamic set | 升级 nftables 到 ≥ 1.0.6 |
 | 某个来源的扫描没被封 | 该 IP 配额在窗口内已用尽（首秒只记前 2 个，之后每秒 1 个） | 属预期：封禁只需 1 条日志；要留更多证据就调大 `LOG_QUOTA_BURST` |
@@ -832,7 +834,7 @@ sudo rm -rf /root/port_scan_guard
 
 只临时停服保留配置：`systemctl stop` 即可。默认 `DESTROY_TABLE_ON_EXIT = False`，停服后 nft 表和黑名单元素保留，但 `prerouting` 链规则被 flush——停服期间不拦截。
 
-> 只有主动停服（SIGTERM/SIGINT）才会清理规则。若进程因未捕获异常崩溃，`atexit` 会**保留** nft 规则不 flush（fail-closed），避免崩溃到重启的窗口内监测端口裸奔；代价是此时不再产生新封禁，需靠 systemd 重启恢复。
+> 清理只发生在主动停服（SIGTERM/SIGINT）。进程异常崩溃时 `atexit` 保留 nft 规则不 flush（fail-closed），监测端口的既有防护不中断；恢复由 systemd 重启完成。
 
 ---
 
