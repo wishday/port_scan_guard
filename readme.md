@@ -22,6 +22,7 @@
 - [十四、故障排查](#十四故障排查)
 - [十五、容器 / macvlan 部署](#十五容器--macvlan-部署)
 - [十六、卸载](#十六卸载)
+- [十七、邮件通知（可选）](#十七邮件通知可选)
 - [附：一页部署速查](#附一页部署速查)
 
 ---
@@ -34,6 +35,7 @@
 - 同时记录 ICMP echo-request（ping）探测：默认只写数据库，不加黑名单、不丢包——用于审计"谁在探测 NAS 是否在线"；把 `ENABLE_ICMP_BAN` 设为 `True` 可改为同样拉黑 24 小时。
 - 规则挂在 `prerouting` 链、优先级 `-110`，即位于 Docker DNAT（`-100`）之前，`saddr` / `dport` 都是原始值。
 - 封禁时查询 IP 归属地（离线库优先；任一字段缺失时改用在线结果），记录写入 SQLite，便于筛选统计。
+- 可选通过 SMTP 发送封禁通知：`ban` / `ban_failed` / `dry_run` 都会发信，支持限速聚合与免打扰推迟，详见[十七、邮件通知](#十七邮件通知可选)。
 
 **能保护**
 
@@ -391,6 +393,8 @@ nft 的规则语句顺序执行、任一 match 失败即中断整条规则，所
 
 - `ENABLE_ICMP_BAN=True` 配 `ENABLE_ICMP_LOG=False`：不影响端口扫描封禁，硬退出会让服务起不来。
 - `NFT_PREROUTING_PRIORITY >= -100`：取值本身合法，nft 也接受，但规则会排在 Docker DNAT（`-100`）之后或与之同时——此时 `dport` 已被改写成容器内端口，清单里的宿主机端口一个都匹配不到，**不报任何错，防护静默失效**。非 Docker 环境用 `-10` 属正常，所以只告警。
+
+邮件通知是可选功能：`NOTIFY_ENABLED=False` 时整段配置不参与校验、不启动线程；开启后的必填项与格式校验见[十七、邮件通知](#十七邮件通知可选)。
 
 ### 6.3 语法检查
 
@@ -847,6 +851,197 @@ sudo rm -rf /root/port_scan_guard
 
 ---
 
+## 十七、邮件通知（可选）
+
+### 17.1 行为概述
+
+- `NOTIFY_ENABLED` 是**独立总开关**，与 `DRY_RUN` 无关：开启后 `ban`、`ban_failed`、`dry_run` 都会发信，主题会标注 `[DRY_RUN]`。
+- ICMP 仅记录模式（`ENABLE_ICMP_BAN=False`）的事件由 `NOTIFY_ICMP_PROBE` 单独控制；ICMP 封禁本身走 `ban()`，属于正常封禁通知。
+- 通知在独立线程完成，SMTP 连接/认证/发送**不会阻塞**日志消费、封禁和写库。
+- 首条事件立即发送；之后 `NOTIFY_INTERVAL` 内的事件合并成一封，窗口结束再发。
+- 免打扰期间只入队不发信，结束后合并成一封补发。
+- 不新增 Python 依赖，只用标准库 `smtplib` / `email`。
+
+### 17.2 配置项
+
+配置在脚本顶部“4.1 邮件通知配置”：
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `NOTIFY_ENABLED` | `False` | 通知总开关；必须是 `True`/`False` |
+| `SMTP_HOST` | `""` | SMTP 服务器，如 `smtp.qq.com` |
+| `SMTP_PORT` | `465` | 465/ssl、587/starttls、25/none |
+| `SMTP_SECURITY` | `"ssl"` | `ssl`（隐式 TLS）/ `starttls`（显式 TLS）/ `none`（明文，不推荐） |
+| `SMTP_USER` | `""` | 登录账号，通常填完整邮箱 |
+| `SMTP_PASSWORD` | `""` | **授权码**，不是登录密码；`SMTP_USER` 非空时必填 |
+| `SMTP_FROM` | `""` | 发件人；留空则用 `SMTP_USER` |
+| `SMTP_TO` | `[]` | 收件人列表，如 `["a@example.com"]` |
+| `SMTP_TIMEOUT` | `10` | 连接/读取超时（秒） |
+| `NOTIFY_INTERVAL` | `300` | 聚合窗口（秒），最小 10 |
+| `NOTIFY_MAX_PENDING` | `5000` | 内存中最多攒多少条，超出丢最旧 |
+| `NOTIFY_MAX_LINES` | `100` | 单封邮件最多列多少条明细 |
+| `NOTIFY_ICMP_PROBE` | `True` | 仅记录模式的 ICMP 事件是否发信 |
+| `NOTIFY_QUIET_START` | `""` | 免打扰开始，如 `"23:00"`；与结束成对填写 |
+| `NOTIFY_QUIET_END` | `""` | 免打扰结束，如 `"07:00"` |
+| `NOTIFY_RETRY` | `3` | 发送失败重试次数（不含首次） |
+
+开启后启动时校验以下内容，非法直接退出并打印中文原因：
+
+- `SMTP_HOST` 非空；`SMTP_PORT` 在 1~65535；
+- `SMTP_SECURITY` 只能是 `ssl` / `starttls` / `none`；
+- `SMTP_FROM`（或 `SMTP_USER`）是合法地址；`SMTP_USER` 非空时授权码必填；
+- `SMTP_TO` 非空且每项含 `@`；
+- `NOTIFY_INTERVAL >= 10`、`NOTIFY_MAX_PENDING >= 1`、`NOTIFY_MAX_LINES >= 1`、`NOTIFY_RETRY >= 0`；
+- 免打扰开始/结束必须同时填写或同时留空，格式 `HH:MM` 且两者不同。
+
+> 注意：`NOTIFY_ENABLED = "False"`（带引号）在 Python 里是真值，会静默开启通知。脚本会直接拒绝字符串，要求真正的 `True`/`False`。
+
+### 17.3 常见邮箱示例
+
+**QQ 邮箱**（设置 → 账户 → 开启 SMTP → 生成授权码）：
+
+```python
+NOTIFY_ENABLED = True
+SMTP_HOST      = "smtp.qq.com"
+SMTP_PORT      = 465
+SMTP_SECURITY  = "ssl"
+SMTP_USER      = "12345678@qq.com"
+SMTP_PASSWORD  = "你的授权码"
+SMTP_TO        = ["you@example.com"]
+```
+
+**163 邮箱**：
+
+```python
+SMTP_HOST = "smtp.163.com"
+SMTP_PORT = 465
+SMTP_SECURITY = "ssl"
+SMTP_USER = "yourname@163.com"
+```
+
+**Gmail**（需开启两步验证后生成 App Password）：
+
+```python
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+SMTP_SECURITY = "starttls"
+SMTP_USER = "yourname@gmail.com"
+```
+
+**自建/局域网中继**：通常用 `587/starttls`；只有明确知道在可信内网时才用 `25/none`。
+
+`SMTP_FROM` 留空时自动等于 `SMTP_USER`。部分服务商要求发件人与登录账号一致，不要随意改成别的地址。
+
+### 17.4 聚合与免打扰
+
+**限速聚合**（`NOTIFY_INTERVAL=300` 为例）：
+
+- 12:00:00 第一条封禁 → 立即发一封；
+- 12:00:01 ~ 12:04:59 又来 20 条 → 不再发，攒着；
+- 12:05:00 窗口到期 → 发一封汇总，包含这 20 条；
+- 没有新事件就不发空邮件；
+- 发送失败按 30s / 60s / 120s 退避重试，期间新事件继续并入同一批；
+- 认证失败（535）会暂停 30 分钟再试，避免每 5 分钟撞一次；
+- QQ/163 等服务商对发信频率有限制，建议 `NOTIFY_INTERVAL >= 60`，默认 300 秒。
+
+**免打扰**（`NOTIFY_QUIET_START="23:00"`、`NOTIFY_QUIET_END="07:00"`）：
+
+- 支持跨午夜，按本机时区判断；
+- 期间事件只入队，不发信；
+- 结束后第一封加 `[免打扰延迟]`，正文注明“免打扰期间暂存，结束后补发”；
+- 队列超过 `NOTIFY_MAX_PENDING` 时丢最旧，下一封注明丢弃条数；
+- 免打扰期间停服，未发送的事件会丢弃（数据库记录不受影响）。
+
+### 17.5 邮件内容
+
+主题示例：
+
+```
+[port_scan_guard_host] 15 条事件（ban 12 / 失败 2 / dry_run 1）12:00-12:05
+```
+
+- `DRY_RUN=True` 时主题前缀 `[DRY_RUN]`；
+- 免打扰补发时前缀 `[免打扰延迟]`；
+- 时间范围在同一分钟时只显示一次（`16:03`），同一天显示 `16:03-16:05`，跨天显示 `11-18 23:59 ~ 11-19 07:00`；
+- 正文包含汇总（总数、去重 IP、按 result / 类型分类、Top 国家 / ISP）和明细（时间、result、目标、归属地、来源）；
+- IPv6 地址/前缀会加方括号，如 `[2001:db8:77::/64]:TCP/22`，避免和端口分隔符混淆；
+- 来源显示为 `离线` / `在线` / `未知`；
+- `ban_failed` 明细会带 nft 失败原因，并对 `No such file or directory` 追加“nft 表可能已被外部删除”、对 `Too many open files` 追加“黑名单 set 已满”；
+- 超过 `NOTIFY_MAX_LINES` 只列前 N 条，并提示其余查数据库。
+
+正文示例：
+
+```
+Port Scan Guard 邮件通知
+实例: port_scan_guard_host
+时间范围: 2026-11-19 23:05:12 ~ 2026-11-19 23:05:40
+聚合窗口: 300 秒（首条立即发送，窗口内合并）
+
+汇总
+  事件: 4 条（去重来源 IP 3 个）
+  result: ban 3 / 失败 1
+  封禁时长: 86400s × 3
+  类型: 端口扫描 3 / ICMP 1
+  国家 Top3: 中国 2，美国 1，俄罗斯 1
+  ISP Top3: 电信 2，Cloudflare 1，unknown 1
+
+明细（最多 100 条）
+  [2026-11-19 23:05:12] ban        1.2.3.4:TCP/22  中国/广东/深圳/电信  [离线]
+  [2026-11-19 23:05:20] ban        5.6.7.8:TCP/3389  美国/California/Los Angeles/Cloudflare  [在线]
+  [2026-11-19 23:05:31] ban_failed 9.9.9.9:TCP/445  俄罗斯/未知/未知/未知  [离线]  原因: No such file or directory（nft 表可能已被外部删除）
+  [2026-11-19 23:05:40] ban        [2001:db8:77::/64]:TCP/22 (触发 2001:db8:77::abcd)  中国/北京/北京/联通  [离线]
+```
+
+### 17.6 测试
+
+`--test-smtp` 只读配置并发一封测试邮件，不启动防护、不碰 nft，因此**不需要 root**。测试前需要先把 `NOTIFY_ENABLED` 改为 `True`（否则会提示“邮件通知未启用”并退出）：
+
+```bash
+/root/port_scan_guard/venv/bin/python3 \
+  /root/port_scan_guard/port_scan_guard_nft.py --test-smtp
+```
+
+成功输出 `[*] 测试邮件已发送 → ...`；授权码错误会输出 `[!] 测试邮件发送失败: (535, ...)`。
+
+正式启动后，横幅会打印通知状态：
+
+```
+[*] 邮件通知：smtp.qq.com:465 SSL，收件人 1 个，聚合 300s（首条立即），免打扰 23:00-07:00
+[*] 邮件通知：ICMP 仅记录事件也发送
+```
+
+### 17.7 安全注意
+
+>`SMTP_PASSWORD` 只保存在脚本配置文件里。仓库里必须保持空值，部署机填写后执行 `chmod 600 port_scan_guard_nft.py`。
+
+- 如果部署目录是 git 仓库，`git pull` 会与本地填写的授权码冲突。可在部署机执行
+  `git update-index --skip-worktree port_scan_guard_nft.py`，或把运行副本放在仓库目录之外。
+- 脚本使用 `ssl.create_default_context()` 校验服务器证书，不要为了“能发出去”关闭证书校验。
+- `SMTP_SECURITY="none"` 会明文传输授权码，启动横幅会告警；仅限可信内网。
+- 通知日志不会打印授权码。
+
+### 17.8 故障排查
+
+| 现象 | 常见原因 |
+|---|---|
+| `(535, b'Error: authentication failed')` | 授权码错误；邮箱未开启 SMTP 服务；账号不是完整邮箱；把登录密码当成了授权码 |
+| `ConnectionRefusedError` / 超时 | 端口与加密方式不匹配（465 必须 `ssl`，587 必须 `starttls`）；服务器/防火墙拦截 |
+| 启动直接退出并提示配置错误 | 按 17.2 的必填项逐条对照；`SMTP_TO` 为空、免打扰只填了一半都会退出 |
+| 收不到邮件，但日志有 `[*] 邮件已发送` | 查垃圾箱；服务商可能对自建域名的 SPF/DKIM 有要求；换成服务商自己的 SMTP 发送端 |
+| 邮件明显延迟 | 处于免打扰时段，或 `NOTIFY_INTERVAL` 窗口内；看主题是否带 `[免打扰延迟]` |
+| 只有第一条邮件，后续没有 | 窗口内事件被合并，等 `NOTIFY_INTERVAL` 结束；或进程已退出 |
+| 日志出现 `[!] 邮件连续 N 次发送失败` | 网络/服务器问题；该批事件已丢弃，数据库仍有记录 |
+
+### 17.9 边界
+
+- 邮件是尽力而为的通知，不保证送达；数据库始终是事实来源。
+- 通知线程退出时最多等 5 秒，未发出的批次直接丢弃并打印条数。
+- 同一 IP 在 `BAN_DEDUP_WINDOW` 内重复扫描不会重复写库，也不会重复发信；已在黑名单中的元素同理。
+- 多实例（宿主 + 容器）各自发信，主题里的 `NFT_TABLE` 用于区分；容器部署时建议按第十五节改为 `port_scan_guard_ctr`，否则两边同名。
+- 极端扫描导致 `NOTIFY_MAX_PENDING` 打满时，邮件正文会注明通知侧丢弃数；记录队列 `_RECORD_QUEUE_MAX` 打满时，记录侧丢弃数只写在服务日志里，邮件无法统计。
+
+---
+
 ## 附：一页部署速查
 
 ```bash
@@ -917,4 +1112,10 @@ sudo systemctl restart port-scan-guard
 
 # 11. 验证规则链
 sudo nft list chain inet port_scan_guard_host prerouting
+
+# 12. 可选：邮件通知（先在配置文件填好 SMTP_PASSWORD）
+chmod 600 /root/port_scan_guard/port_scan_guard_nft.py
+sudo /root/port_scan_guard/venv/bin/python3 \
+  /root/port_scan_guard/port_scan_guard_nft.py --test-smtp
+sudo systemctl restart port-scan-guard
 ```

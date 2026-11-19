@@ -38,11 +38,16 @@ import select
 import shlex
 import shutil
 import signal
+import smtplib
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
 import time
+from collections import Counter
+from email.message import EmailMessage
+from email.utils import formatdate
 from typing import Optional
 
 # ============================================================
@@ -426,6 +431,32 @@ DB_CLEANUP_INTERVAL  = 86400     # 清理检查间隔（秒）—— 默认 24 �
 DB_VACUUM_AFTER_CLEANUP = False  # 清理后是否 VACUUM（重写全库，慎用）
 
 # ============================================================
+#                  4.1 邮件通知配置（可选）
+# ============================================================
+# ★ NOTIFY_ENABLED 是通知总开关，与 DRY_RUN 无关：
+#   开启后 ban / ban_failed / dry_run 都会发信，邮件主题会标注 [DRY_RUN]。
+# ★ ICMP 仅记录模式（ENABLE_ICMP_BAN=False）的事件由 NOTIFY_ICMP_PROBE
+#   单独控制；ICMP 封禁本身走 ban()，属于正常封禁通知。
+# ★ 授权码只保存在本文件：仓库里请保持空值，部署机 chmod 600 后再填写。
+NOTIFY_ENABLED      = False
+SMTP_HOST           = ""          # 如 smtp.qq.com
+SMTP_PORT           = 465
+SMTP_SECURITY       = "ssl"       # ssl(465) | starttls(587) | none(25，明文，不推荐)
+SMTP_USER           = ""
+SMTP_PASSWORD       = ""          # 授权码，不是登录密码
+SMTP_FROM           = ""          # 留空则用 SMTP_USER
+SMTP_TO             = []          # 收件人列表，如 ["a@example.com"]
+SMTP_TIMEOUT        = 10          # 连接/读取超时（秒）
+
+NOTIFY_INTERVAL     = 300         # 聚合窗口（秒）：首条立即发，窗口内合并
+NOTIFY_MAX_PENDING  = 5000        # 内存中最多攒多少条，超出丢最旧
+NOTIFY_MAX_LINES    = 100         # 单封邮件最多列多少条明细
+NOTIFY_ICMP_PROBE   = True        # 仅记录模式的 ICMP 探测是否也发信
+NOTIFY_QUIET_START  = ""          # 免打扰开始，如 "23:00"；留空表示关闭
+NOTIFY_QUIET_END    = ""          # 免打扰结束，如 "07:00"
+NOTIFY_RETRY        = 3           # 发送失败重试次数
+
+# ============================================================
 #                      以下为脚本逻辑
 # ============================================================
 
@@ -461,6 +492,18 @@ _record_worker = None
 _record_stop = threading.Event()
 # 由日志线程预约、写库线程执行的数据库清理信号（见 _maybe_cleanup_db）
 _cleanup_due = threading.Event()
+# 邮件通知：写库线程只负责入队，SMTP 收发全部在独立线程完成
+_notify_pending = []
+_notify_lock = threading.Lock()
+_notify_wake = threading.Event()
+_notify_stop = threading.Event()
+_notify_thread = None
+_notify_last_sent = None          # monotonic 时间；None 表示本次运行还没发过
+_notify_retry_at = 0.0
+_notify_retry_count = 0
+_notify_auth_until = 0.0
+_notify_auth_warned = False
+_notify_dropped_total = 0
 _last_queue_warn_ts = 0.0
 _queue_dropped_total = 0         # 队列满时被挤掉/丢弃的记录累计数
 
@@ -626,6 +669,96 @@ _TIMEOUT_RE  = re.compile(r"^0*[1-9]\d*(?:ms|s|m|h|d)$")    # 必须带单位，
 # nft 的 log prefix 上限是 127 字节（含结尾 NUL），实测 127 报
 # "log prefix is too long"、126 通过。留 6 字节余量给"前缀 + 空格"。
 _PREFIX_MAX = 120
+
+
+def _parse_hhmm(value):
+    """把 "HH:MM" 解析成当天分钟数；非法返回 None。"""
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour * 60 + minute
+
+
+def _validate_notify_config(errs):
+    """校验邮件通知配置；NOTIFY_ENABLED=False 时直接跳过。"""
+    if not isinstance(NOTIFY_ENABLED, bool):
+        errs.append(f"NOTIFY_ENABLED={NOTIFY_ENABLED!r} 必须是 True/False"
+                    f'（字符串 "False" 也是真值，会造成开关静默反转）')
+        return
+    if not NOTIFY_ENABLED:
+        return
+
+    if not isinstance(SMTP_HOST, str) or not SMTP_HOST.strip():
+        errs.append(f"SMTP_HOST={SMTP_HOST!r} 必须是非空字符串")
+    elif SMTP_HOST != SMTP_HOST.strip():
+        errs.append("SMTP_HOST 不能有首尾空格")
+    if not isinstance(SMTP_PORT, int) or isinstance(SMTP_PORT, bool) \
+            or not (1 <= SMTP_PORT <= 65535):
+        errs.append(f"SMTP_PORT={SMTP_PORT!r} 必须是 1~65535 的整数")
+    if SMTP_SECURITY not in ("ssl", "starttls", "none"):
+        errs.append(f"SMTP_SECURITY={SMTP_SECURITY!r} 只能是 "
+                    f"'ssl'（465）/ 'starttls'（587）/ 'none'（25）")
+    for name, val in (("SMTP_USER", SMTP_USER),
+                      ("SMTP_PASSWORD", SMTP_PASSWORD),
+                      ("SMTP_FROM", SMTP_FROM)):
+        if not isinstance(val, str):
+            errs.append(f"{name}={val!r} 必须是字符串")
+    if isinstance(SMTP_USER, str) and SMTP_USER != SMTP_USER.strip():
+        errs.append("SMTP_USER 不能有首尾空格")
+    if not isinstance(SMTP_TIMEOUT, (int, float)) \
+            or isinstance(SMTP_TIMEOUT, bool) or SMTP_TIMEOUT <= 0:
+        errs.append(f"SMTP_TIMEOUT={SMTP_TIMEOUT!r} 必须是正数（秒）")
+
+    from_addr = (SMTP_FROM or SMTP_USER) if isinstance(SMTP_FROM, str) \
+        and isinstance(SMTP_USER, str) else ""
+    if not from_addr or "@" not in from_addr:
+        errs.append("SMTP_FROM（或 SMTP_USER）必须填写发件人邮箱地址")
+    elif "\r" in from_addr or "\n" in from_addr:
+        errs.append("SMTP_FROM / SMTP_USER 不能含换行")
+    if isinstance(SMTP_USER, str) and SMTP_USER.strip() \
+            and isinstance(SMTP_PASSWORD, str) and not SMTP_PASSWORD:
+        errs.append("SMTP_USER 非空时 SMTP_PASSWORD（授权码）不能为空")
+
+    if not isinstance(SMTP_TO, (list, tuple)) or not SMTP_TO:
+        errs.append(f"SMTP_TO={SMTP_TO!r} 必须是非空列表")
+    else:
+        for addr in SMTP_TO:
+            if not isinstance(addr, str) or "@" not in addr:
+                errs.append(f"SMTP_TO 含非法收件人 {addr!r}")
+            elif "\r" in addr or "\n" in addr:
+                errs.append(f"SMTP_TO 的收件人 {addr!r} 不能含换行")
+
+    for name, val, minimum in (
+            ("NOTIFY_INTERVAL", NOTIFY_INTERVAL, 10),
+            ("NOTIFY_MAX_PENDING", NOTIFY_MAX_PENDING, 1),
+            ("NOTIFY_MAX_LINES", NOTIFY_MAX_LINES, 1),
+            ("NOTIFY_RETRY", NOTIFY_RETRY, 0)):
+        if not isinstance(val, int) or isinstance(val, bool) or val < minimum:
+            errs.append(f"{name}={val!r} 必须是 >= {minimum} 的整数")
+    if not isinstance(NOTIFY_ICMP_PROBE, bool):
+        errs.append(f"NOTIFY_ICMP_PROBE={NOTIFY_ICMP_PROBE!r} 必须是 "
+                    f"True/False")
+
+    qs, qe = NOTIFY_QUIET_START, NOTIFY_QUIET_END
+    if bool(qs) != bool(qe):
+        errs.append("NOTIFY_QUIET_START 与 NOTIFY_QUIET_END 必须同时填写或"
+                    "同时留空")
+    elif qs and qe:
+        ms, me = _parse_hhmm(qs), _parse_hhmm(qe)
+        if ms is None or me is None:
+            errs.append(f"免打扰时间格式必须是 HH:MM（当前 "
+                        f"{qs!r} / {qe!r}）")
+        elif ms == me:
+            errs.append("NOTIFY_QUIET_START 与 NOTIFY_QUIET_END 不能相同"
+                        "（留空表示关闭免打扰）")
 
 
 def _validate_config():
@@ -851,6 +984,8 @@ def _validate_config():
     # ★ ENABLE_ICMP_BAN=True + ENABLE_ICMP_LOG=False 只告警不退出：
     #   该组合不影响端口扫描封禁，硬退出会让服务起不来，比"ICMP 不封禁"更糟。
     #   告警统一放在 main() 的启动横幅里，这里不重复打印。
+
+    _validate_notify_config(errs)
 
     if errs:
         print("[!] 配置校验未通过：", flush=True)
@@ -1787,6 +1922,9 @@ def _write_record(job, allow_online=True):
     except (sqlite3.Error, OSError) as e:
         print(f"[!] 写库失败 {job['ip']}: {e}", flush=True)
 
+    # 通知只做内存入队；即使写库失败，封禁事件本身仍然通知。
+    _notify_record(job, info)
+
     if job["kind"] == "icmp":
         print(f"[{job['time_str']}] icmp_probe {job['ip']} "
               f"({info['country']}/{info['province']}/"
@@ -1891,6 +2029,382 @@ def _stop_record_worker() -> bool:
     return True
 
 
+# ---------------- 邮件通知 ----------------
+
+def _in_quiet_hours(ts=None) -> bool:
+    """当前是否处于免打扰时段；未配置或格式非法时返回 False。"""
+    start = _parse_hhmm(NOTIFY_QUIET_START)
+    end = _parse_hhmm(NOTIFY_QUIET_END)
+    if start is None or end is None:
+        return False
+    lt = time.localtime(time.time() if ts is None else ts)
+    cur = lt.tm_hour * 60 + lt.tm_min
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end      # 跨午夜，如 23:00-07:00
+
+
+def _enqueue_notification(ev: dict):
+    """写库线程调用：只入内存队列，绝不在这里做 SMTP I/O。"""
+    global _notify_dropped_total
+    if not NOTIFY_ENABLED:
+        return
+    with _notify_lock:
+        _notify_pending.append(ev)
+        extra = len(_notify_pending) - NOTIFY_MAX_PENDING
+        if extra > 0:
+            del _notify_pending[:extra]
+            _notify_dropped_total += extra
+    _notify_wake.set()
+
+
+def _requeue_notification_batch(batch: list, dropped: int):
+    """发送失败时把整批放回队首，并恢复被统计的丢弃数。"""
+    global _notify_dropped_total
+    with _notify_lock:
+        _notify_pending[:0] = batch
+        _notify_dropped_total += dropped
+        extra = len(_notify_pending) - NOTIFY_MAX_PENDING
+        if extra > 0:
+            del _notify_pending[:extra]
+            _notify_dropped_total += extra
+    _notify_wake.set()
+
+
+def _fmt_counter(counter: Counter, limit: int = 3) -> str:
+    return "，".join(f"{k} {v}" for k, v in counter.most_common(limit))
+
+
+_RESULT_LABEL = {
+    "ban": "ban",
+    "ban_failed": "失败",
+    "dry_run": "dry_run",
+    "icmp_probe": "ICMP记录",
+}
+_EVENT_TYPE_LABEL = {"port_scan": "端口扫描", "icmp": "ICMP"}
+_SOURCE_LABEL = {"offline": "离线", "online": "在线", "unknown": "未知"}
+
+
+def _format_event_line(ev: dict) -> str:
+    target = ev.get("shown") or ev.get("ip", "")
+    # IPv6 地址/前缀本身含冒号，必须加方括号，否则 "::/64:TCP/22"
+    # 会被读成地址的一部分。
+    if ":" in target:
+        target = f"[{target}]"
+    tag = ev.get("tag") or ""
+    if ev.get("result") == "icmp_probe":
+        tag = f"/{ev.get('protocol') or 'ICMP'}"
+    trig = ev.get("trig") or ""
+    loc = (f"{ev.get('country', UNKNOWN)}/{ev.get('province', UNKNOWN)}/"
+           f"{ev.get('city', UNKNOWN)}/{ev.get('isp', UNKNOWN)}")
+    src = ev.get("source", "unknown")
+    src = _SOURCE_LABEL.get(src, src)
+    line = (f"  [{ev.get('time_str', '')}] {ev.get('result', ''):<10} "
+            f"{target}{tag}{trig}  {loc}  [{src}]")
+    if ev.get("error"):
+        err = str(ev["error"]).replace("\r", " ").replace("\n", " ")
+        low = err.lower()
+        if "no such file or directory" in low or "not found" in low:
+            hint = "（nft 表可能已被外部删除）"
+        elif "too many open files" in low:
+            hint = "（黑名单 set 已满）"
+        else:
+            hint = ""
+        line += f"  原因: {err}{hint}"
+    return line[:400]
+
+
+def _subject_time_range(start_ts, end_ts) -> str:
+    s = time.localtime(start_ts)
+    e = time.localtime(end_ts)
+    if (s.tm_year, s.tm_yday) == (e.tm_year, e.tm_yday):
+        if (s.tm_hour, s.tm_min) == (e.tm_hour, e.tm_min):
+            return time.strftime("%H:%M", s)
+        return f"{time.strftime('%H:%M', s)}-{time.strftime('%H:%M', e)}"
+    return (f"{time.strftime('%m-%d %H:%M', s)} ~ "
+            f"{time.strftime('%m-%d %H:%M', e)}")
+
+
+def _build_notification(batch: list, dropped: int,
+                        deferred: bool):
+    tag = NFT_TABLE
+    start_ts = min(ev["ts"] for ev in batch)
+    end_ts = max(ev["ts"] for ev in batch)
+    start_str = time.strftime("%F %T", time.localtime(start_ts))
+    end_str = time.strftime("%F %T", time.localtime(end_ts))
+    results = Counter(ev.get("result", "") for ev in batch)
+    types = Counter(ev.get("event_type", "port_scan") for ev in batch)
+    countries = Counter(ev.get("country", UNKNOWN) for ev in batch)
+    isps = Counter(ev.get("isp", UNKNOWN) for ev in batch)
+    unique_ips = len({ev.get("ip") for ev in batch})
+
+    result_str = " / ".join(
+        f"{_RESULT_LABEL[k]} {results[k]}"
+        for k in ("ban", "ban_failed", "dry_run", "icmp_probe")
+        if results.get(k))
+    if not result_str:
+        result_str = " / ".join(f"{k} {v}"
+                                for k, v in results.most_common())
+    subject = f"[{tag}] {len(batch)} 条事件（{result_str}"
+    if dropped:
+        subject += f"；另丢 {dropped}"
+    subject += f"）{_subject_time_range(start_ts, end_ts)}"
+    if DRY_RUN:
+        subject = "[DRY_RUN] " + subject
+    if deferred:
+        subject = "[免打扰延迟] " + subject
+    if len(subject) > 150:
+        subject = subject[:147] + "..."
+
+    type_str = " / ".join(
+        f"{_EVENT_TYPE_LABEL.get(k, k)} {v}"
+        for k, v in types.most_common())
+    ban_durations = Counter(ev.get("duration", 0) for ev in batch
+                            if ev.get("result") == "ban")
+    duration_str = " / ".join(f"{d}s × {c}"
+                              for d, c in ban_durations.most_common())
+    lines = [
+        "Port Scan Guard 邮件通知",
+        f"实例: {tag}",
+        f"时间范围: {start_str} ~ {end_str}",
+        f"聚合窗口: {NOTIFY_INTERVAL} 秒（首条立即发送，窗口内合并）",
+    ]
+    if deferred:
+        lines.append("说明: 免打扰期间暂存，结束后补发")
+    lines += [
+        "",
+        "汇总",
+        f"  事件: {len(batch)} 条（去重来源 IP {unique_ips} 个）",
+        f"  result: {result_str}",
+    ]
+    if duration_str:
+        lines.append(f"  封禁时长: {duration_str}")
+    lines += [
+        f"  类型: {type_str}",
+        f"  国家 Top3: {_fmt_counter(countries)}",
+        f"  ISP Top3: {_fmt_counter(isps)}",
+    ]
+    if dropped:
+        lines.append(f"  ★ 另有 {dropped} 条因通知队列积压被丢弃，"
+                     f"未包含在上面的明细中")
+    lines += ["", f"明细（最多 {NOTIFY_MAX_LINES} 条）"]
+    lines.extend(_format_event_line(ev)
+                 for ev in batch[:NOTIFY_MAX_LINES])
+    if len(batch) > NOTIFY_MAX_LINES:
+        lines.append(f"  ...（其余 {len(batch) - NOTIFY_MAX_LINES} 条省略，"
+                     f"可查询数据库）")
+    return subject, "\n".join(lines)
+
+
+def _send_mail(subject: str, body: str):
+    """同步发送一封邮件；失败直接抛异常，由调用方决定重试。"""
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM or SMTP_USER
+    msg["To"] = ", ".join(SMTP_TO)
+    msg["Date"] = formatdate(localtime=True)
+    # base64 避免老 SMTP 服务器不支持 8BITMIME 时中文正文被截断/乱码
+    msg.set_content(body, charset="utf-8", cte="base64")
+
+    context = ssl.create_default_context()
+    if SMTP_SECURITY == "ssl":
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT,
+                              timeout=SMTP_TIMEOUT,
+                              context=context) as smtp:
+            if SMTP_USER:
+                smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(msg)
+    elif SMTP_SECURITY == "starttls":
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT,
+                          timeout=SMTP_TIMEOUT) as smtp:
+            smtp.ehlo()
+            smtp.starttls(context=context)
+            smtp.ehlo()
+            if SMTP_USER:
+                smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT,
+                          timeout=SMTP_TIMEOUT) as smtp:
+            if SMTP_USER:
+                smtp.login(SMTP_USER, SMTP_PASSWORD)
+            smtp.send_message(msg)
+
+
+def _notify_worker_loop():
+    global _notify_pending, _notify_last_sent, _notify_retry_at
+    global _notify_retry_count, _notify_auth_until, _notify_auth_warned
+    global _notify_dropped_total
+
+    was_quiet = False
+    while not _notify_stop.is_set():
+        _notify_wake.wait(timeout=1.0)
+        _notify_wake.clear()
+        if _notify_stop.is_set():
+            break
+
+        # 先判断免打扰，再判断重试退避：否则退避恰好跨过免打扰结束时，
+        # was_quiet 不会被置位，补发的邮件会漏掉 [免打扰延迟] 标记。
+        if _in_quiet_hours():
+            was_quiet = True
+            continue
+
+        now = time.monotonic()
+        with _notify_lock:
+            if not _notify_pending:
+                # 免打扰结束但队列为空：清除标记，避免很久以后的第一条
+                # 事件被误标成 [免打扰延迟]。
+                was_quiet = False
+                continue
+            if now < _notify_retry_at or now < _notify_auth_until:
+                continue
+            # 首条立即发；之后每 NOTIFY_INTERVAL 最多一封；免打扰结束
+            # 强制补发一次。
+            due = (_notify_last_sent is None
+                   or now - _notify_last_sent >= NOTIFY_INTERVAL
+                   or was_quiet)
+            if not due:
+                continue
+            batch = _notify_pending
+            _notify_pending = []
+            dropped = _notify_dropped_total
+            _notify_dropped_total = 0
+
+        deferred = was_quiet
+        was_quiet = False
+        try:
+            subject, body = _build_notification(batch, dropped, deferred)
+        except Exception as e:  # noqa: BLE001 - 不能让通知线程因坏数据退出
+            print(f"[!] 邮件内容生成失败，丢弃 {len(batch)} 条事件: {e}",
+                  flush=True)
+            continue
+        try:
+            _send_mail(subject, body)
+        except smtplib.SMTPAuthenticationError as e:
+            _requeue_notification_batch(batch, dropped)
+            _notify_auth_until = time.monotonic() + 1800
+            if not _notify_auth_warned:
+                _notify_auth_warned = True
+                print(f"[!] 邮件认证失败，暂停 30 分钟再试：{e}",
+                      flush=True)
+            continue
+        except Exception as e:  # noqa: BLE001 - 通知线程不能因发送失败退出
+            _notify_retry_count += 1
+            if _notify_retry_count <= NOTIFY_RETRY:
+                _requeue_notification_batch(batch, dropped)
+                backoff = 30 * (2 ** (_notify_retry_count - 1))
+                _notify_retry_at = time.monotonic() + backoff
+                print(f"[!] 邮件发送失败（第 {_notify_retry_count}/"
+                      f"{NOTIFY_RETRY} 次，{backoff}s 后重试）: {e}",
+                      flush=True)
+            else:
+                _notify_retry_count = 0
+                _notify_retry_at = 0.0
+                if NOTIFY_RETRY:
+                    print(f"[!] 邮件连续 {NOTIFY_RETRY} 次发送失败，"
+                          f"丢弃 {len(batch) + dropped} 条事件: {e}",
+                          flush=True)
+                else:
+                    print(f"[!] 邮件发送失败（NOTIFY_RETRY=0，未重试），"
+                          f"丢弃 {len(batch) + dropped} 条事件: {e}",
+                          flush=True)
+            continue
+
+        _notify_last_sent = time.monotonic()
+        _notify_retry_count = 0
+        _notify_retry_at = 0.0
+        _notify_auth_warned = False
+        print(f"[*] 邮件已发送：{len(batch)} 条 → {', '.join(SMTP_TO)}",
+              flush=True)
+
+
+def _start_notify_worker():
+    global _notify_thread
+    if not NOTIFY_ENABLED:
+        return
+    _notify_stop.clear()
+    _notify_wake.clear()
+    thread = threading.Thread(target=_notify_worker_loop,
+                              name="mail-notify", daemon=True)
+    thread.start()
+    # start() 失败时保持 _notify_thread 为 None，避免 finally 里对未启动
+    # 的线程调用 join() 抛 RuntimeError 掩盖原始错误。
+    _notify_thread = thread
+
+
+def _stop_notify_worker():
+    global _notify_thread
+    if _notify_thread is None:
+        return
+    _notify_stop.set()
+    _notify_wake.set()
+    _notify_thread.join(timeout=5)
+    with _notify_lock:
+        pending = len(_notify_pending)
+    if _notify_thread.is_alive():
+        print(f"[!] 邮件通知线程 5 秒内未退出，{pending} 条待发事件丢弃",
+              flush=True)
+    elif pending:
+        print(f"[*] 退出时丢弃 {pending} 条未发送的邮件事件", flush=True)
+    _notify_thread = None
+
+
+def _notify_record(job: dict, info: dict):
+    """写库线程在归属地解析完成后调用，只做一次内存入队。"""
+    if not NOTIFY_ENABLED:
+        return
+    # 只拦“仅记录”的 ICMP 探测；ICMP 封禁的 result 是 ban/ban_failed，
+    # 不受 NOTIFY_ICMP_PROBE 影响。
+    if job.get("result") == "icmp_probe" and not NOTIFY_ICMP_PROBE:
+        return
+    _enqueue_notification({
+        "ts": job["ts"],
+        "time_str": job["time_str"],
+        "ip": job["ip"],
+        "family": job["family"],
+        "port": job.get("port"),
+        "protocol": job.get("protocol"),
+        "result": job["result"],
+        "event_type": job.get("event_type", "port_scan"),
+        "duration": job.get("duration", 0),
+        # ICMP 仅记录事件没有 shown，留空让 _format_event_line 补 /ICMP
+        "shown": job.get("shown", ""),
+        "tag": job.get("tag", ""),
+        "trig": job.get("trig", ""),
+        "country": info["country"],
+        "province": info["province"],
+        "city": info["city"],
+        "isp": info["isp"],
+        "source": info["source"],
+        "error": job.get("error", ""),
+    })
+
+
+def _test_smtp() -> int:
+    """--test-smtp：只校验邮件配置并发送一封测试邮件。"""
+    errs = []
+    _validate_notify_config(errs)
+    if not NOTIFY_ENABLED:
+        print("[!] NOTIFY_ENABLED=False，邮件通知未启用", flush=True)
+        return 1
+    if errs:
+        print("[!] 邮件配置校验未通过：", flush=True)
+        for e in errs:
+            print(f"    - {e}", flush=True)
+        return 1
+    subject = f"[{NFT_TABLE}] 测试邮件"
+    body = ("这是一封来自 Port Scan Guard 的测试邮件。\n"
+            f"SMTP: {SMTP_HOST}:{SMTP_PORT} ({SMTP_SECURITY})\n"
+            f"时间: {time.strftime('%F %T')}\n")
+    try:
+        _send_mail(subject, body)
+    except Exception as e:  # noqa: BLE001 - 测试命令需要打印原始失败原因
+        print(f"[!] 测试邮件发送失败: {e}", flush=True)
+        return 1
+    print(f"[*] 测试邮件已发送 → {', '.join(SMTP_TO)}", flush=True)
+    return 0
+
+
 def ban(ip: str, port: Optional[int] = None,  # noqa: UP045 - 保持 Python 3.7 兼容
         protocol: Optional[str] = None,  # noqa: UP045 - 保持 Python 3.7 兼容
         kind: str = "scan", event_type: str = "port_scan"):
@@ -1923,6 +2437,7 @@ def ban(ip: str, port: Optional[int] = None,  # noqa: UP045 - 保持 Python 3.7 
     set_key = _v6_net_key(addr) if is_v6 else ip
 
     skip = _should_skip_dedup(set_key, kind)
+    fail_reason = ""
 
     if DRY_RUN:
         # DRY_RUN 下也走去重，避免日志狂刷时把库写爆
@@ -1956,6 +2471,7 @@ def ban(ip: str, port: Optional[int] = None,  # noqa: UP045 - 保持 Python 3.7 
                   f"（inet {NFT_TABLE} / {setname}），跳过本次 add: "
                   f"{get_err or 'unknown error'}", flush=True)
             result = "ban_failed"
+            fail_reason = get_err or "查询封禁元素失败"
         else:
             r = _nft(["add", "element", "inet", NFT_TABLE, setname,
                       f"{{ {set_key} timeout {BAN_TIME}s }}"])
@@ -1963,6 +2479,7 @@ def ban(ip: str, port: Optional[int] = None,  # noqa: UP045 - 保持 Python 3.7 
                 result = "ban"
             else:
                 result = "ban_failed"
+                fail_reason = (r.stderr or "").strip() or "nft 添加元素失败"
                 print(f"[!] nft 添加元素失败 {set_key}"
                       f"（inet {NFT_TABLE} / {setname}）: {r.stderr.strip()}",
                       flush=True)
@@ -2021,6 +2538,7 @@ def ban(ip: str, port: Optional[int] = None,  # noqa: UP045 - 保持 Python 3.7 
         "shown": shown,
         "tag": tag,
         "trig": trig,
+        "error": fail_reason,
     })
 
 
@@ -2277,6 +2795,7 @@ def main():
 
     init_ip_lookup()
     _start_record_worker()
+    _start_notify_worker()
     setup_firewall()
 
     print(f"[*] 已就绪：TCP {len(set(TCP_PORTS))} 个 / "
@@ -2352,6 +2871,26 @@ def main():
     if DESTROY_TABLE_ON_EXIT:
         print("[*] 退出时将删除 nft 表（停服即解封）", flush=True)
 
+    if NOTIFY_ENABLED:
+        quiet = ""
+        if NOTIFY_QUIET_START and NOTIFY_QUIET_END:
+            quiet = f"，免打扰 {NOTIFY_QUIET_START}-{NOTIFY_QUIET_END}"
+        print(f"[*] 邮件通知：{SMTP_HOST}:{SMTP_PORT} "
+              f"{SMTP_SECURITY.upper()}，收件人 {len(SMTP_TO)} 个，"
+              f"聚合 {NOTIFY_INTERVAL}s（首条立即）{quiet}", flush=True)
+        if ENABLE_ICMP_LOG and not ENABLE_ICMP_BAN:
+            print(f"[*] 邮件通知：ICMP 仅记录事件"
+                  f"{'也发送' if NOTIFY_ICMP_PROBE else '不发送'}",
+                  flush=True)
+        if SMTP_SECURITY == "none" and SMTP_USER:
+            print("[!] SMTP_SECURITY = none：授权码将以明文传输，"
+                  "建议改用 465/ssl 或 587/starttls", flush=True)
+        if DRY_RUN:
+            print("[!] DRY_RUN = True：邮件会标注 [DRY_RUN]，"
+                  "dry_run 事件也会发送", flush=True)
+    else:
+        print("[*] 邮件通知：未启用（NOTIFY_ENABLED = False）", flush=True)
+
     # 启动时立即预约一次清理（实际由写库线程执行，不阻塞日志消费）
     _maybe_cleanup_db()
 
@@ -2405,13 +2944,18 @@ def main():
 
 
 if __name__ == "__main__":
+    # 只读配置 + 发一封测试邮件，不碰 nft，因此不要求 root。
+    if "--test-smtp" in sys.argv[1:]:
+        sys.exit(_test_smtp())
+
     try:
         main()
     except KeyboardInterrupt:
         print("\n[*] 已退出")
     finally:
-        # 先停后台写库线程，再关数据库连接；线程未结束时不能 close，
-        # 否则它会继续向已关闭的 sqlite 连接写入。
+        # 先停通知线程，再停写库线程，最后关数据库连接；线程未结束时
+        # 不能 close，否则它会继续向已关闭的 sqlite 连接写入。
+        _stop_notify_worker()
         worker_stopped = _stop_record_worker()
         if _db_conn is not None:
             if worker_stopped:
