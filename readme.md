@@ -699,7 +699,7 @@ ls -lh /root/port_scan_guard/scan.db*
 
 ### 13.1 自动清理
 
-脚本按 `DB_CLEANUP_INTERVAL`（默认 86400 秒 = 24 小时）检查一次，删除 `DB_RETENTION_DAYS`（默认 180 天）之前的记录；启动时也会立刻清一次。
+脚本按 `DB_CLEANUP_INTERVAL`（默认 86400 秒 = 24 小时）检查一次，删除 `DB_RETENTION_DAYS`（默认 180 天）之前的记录；启动时也会立刻预约一次。清理在写库线程执行，不阻塞日志消费与封禁。
 
 ### 13.2 手动 VACUUM（可选）
 

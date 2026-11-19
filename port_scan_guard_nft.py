@@ -448,7 +448,7 @@ ICMP_PROBE_RE = re.compile(
 _searcher_v4 = None
 _searcher_v6 = None
 _db_conn     = None
-_db_lock     = threading.Lock()   # 主线程清理 / 后台写库线程共用连接
+_db_lock     = threading.Lock()   # 后台写库线程内串行使用（清理与写入）
 # ip2region.Searcher 内部共用文件句柄（seek/read）与 io_count，
 # 不是线程安全的：离线查询统一串行化，防止多调用点并发复用。
 _ip_lookup_lock = threading.Lock()
@@ -685,7 +685,8 @@ def _validate_config():
                 f"ICMP_PROBE_PREFIX={ICMP_PROBE_PREFIX!r} 的子串："
                 "两者不得互为子串；同机多实例部署时，一个实例的前缀"
                 "也不得是另一个实例前缀的子串/后缀"
-                "（例如 HOST_SCAN: 与 CTR_HOST_SCAN:）")
+                "（本校验只覆盖单实例内，跨实例需自行保证，"
+                "例如 HOST_SCAN: 与 CTR_HOST_SCAN:）")
 
     # ---- 端口清单 ----
     for name, ports in (("TCP_PORTS", TCP_PORTS), ("UDP_PORTS", UDP_PORTS)):
@@ -1808,10 +1809,13 @@ def _record_worker_loop():
         # 日志消费线程（大库 DELETE/VACUUM 可能持续数秒）。
         if _cleanup_due.is_set():
             _cleanup_due.clear()
-            try:
-                _cleanup_db()
-            except Exception as e:  # noqa: BLE001 - 清理失败不能终止写库线程
-                print(f"[!] 数据库清理异常: {e}", flush=True)
+            # 退出阶段不再启动可能耗时较久的 DELETE/VACUUM，避免拖住
+            # _stop_record_worker() 的 join；清理留到下次启动。
+            if not _record_stop.is_set():
+                try:
+                    _cleanup_db()
+                except Exception as e:  # noqa: BLE001 - 清理失败不能终止写库线程
+                    print(f"[!] 数据库清理异常: {e}", flush=True)
 
         try:
             job = _record_queue.get(timeout=0.5)
@@ -1877,6 +1881,7 @@ def _stop_record_worker() -> bool:
     if _record_worker is None:
         return True
     _record_stop.set()
+    _cleanup_due.clear()      # 退出阶段不再接受新的清理请求
     _record_worker.join(timeout=10)
     if _record_worker.is_alive():
         print(f"[!] 退出超时：仍有 {_record_queue.qsize()} 条归属地记录未写库；"
@@ -2347,7 +2352,7 @@ def main():
     if DESTROY_TABLE_ON_EXIT:
         print("[*] 退出时将删除 nft 表（停服即解封）", flush=True)
 
-    # 启动时立即执行一次清理
+    # 启动时立即预约一次清理（实际由写库线程执行，不阻塞日志消费）
     _maybe_cleanup_db()
 
     open_fail_count = 0
