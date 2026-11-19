@@ -225,6 +225,10 @@ DRY_RUN    = False
 
 PORT_SCAN_PREFIX  = "HOST_SCAN:"     # 端口扫描日志前缀（内核 nft log），容器与host需要区分，否则会同时封禁
 ICMP_PROBE_PREFIX = "HOST_ICMP:"    # ICMP 探测日志前缀，容器与host需要区分，否则会同时封禁
+# ★ 同机多实例（宿主 + 容器）：两个实例的所有前缀都不得互为子串/后缀。
+#   例如宿主用 HOST_SCAN:、容器用 CTR_HOST_SCAN: 时，宿主的 HOST_SCAN:
+#   是容器前缀的子串，容器日志会被宿主实例误吞并去封禁。推荐如
+#   CTR_SCAN: / CTR_ICMP: 这类无包含关系的命名。
 
 # nft 表名（inet 族，与 Docker 的 ip/ip6 族隔离）
 NFT_TABLE = "port_scan_guard_host"
@@ -455,6 +459,8 @@ _RECORD_QUEUE_MAX = 20000
 _record_queue = queue.Queue(maxsize=_RECORD_QUEUE_MAX)
 _record_worker = None
 _record_stop = threading.Event()
+# 由日志线程预约、写库线程执行的数据库清理信号（见 _maybe_cleanup_db）
+_cleanup_due = threading.Event()
 _last_queue_warn_ts = 0.0
 _queue_dropped_total = 0         # 队列满时被挤掉/丢弃的记录累计数
 
@@ -632,6 +638,9 @@ def _validate_config():
         - ICMP_PROBE_PREFIX 是 PORT_SCAN_PREFIX 的子串
       两者都会让端口扫描日志在 _dispatch_log_line 里被判成 ICMP 探测，
       结果是"永远不封禁端口扫描"，日志里毫无异常。实测确认。
+      反向包含（PORT 是 ICMP 的子串）在单实例内本身无害，但同机多实例
+      部署时会让一个实例吞掉另一个实例的日志，因此也一并拒绝：统一规则
+      是"两个前缀不得互为子串"。
     """
     errs = []
 
@@ -666,6 +675,17 @@ def _validate_config():
                 f"PORT_SCAN_PREFIX={PORT_SCAN_PREFIX!r} 的子串："
                 "每条扫描日志都含 ICMP 前缀，会被判成 ICMP 探测，"
                 "端口扫描将永不封禁（两者不要有包含关系）")
+        elif PORT_SCAN_PREFIX and PORT_SCAN_PREFIX in ICMP_PROBE_PREFIX:
+            # 单实例内这个方向本身无害（ICMP 分支先 return，端口行不会被
+            # 误判）；但同机多实例部署时，若另一个实例的前缀是本实例前缀
+            # 的超串，其日志行会被本实例当作自己的事件。统一按"不得互为
+            # 子串"拒绝，避免 HOST_SCAN: 与 CTR_HOST_SCAN: 这类自然命名踩坑。
+            errs.append(
+                f"PORT_SCAN_PREFIX={PORT_SCAN_PREFIX!r} 是 "
+                f"ICMP_PROBE_PREFIX={ICMP_PROBE_PREFIX!r} 的子串："
+                "两者不得互为子串；同机多实例部署时，一个实例的前缀"
+                "也不得是另一个实例前缀的子串/后缀"
+                "（例如 HOST_SCAN: 与 CTR_HOST_SCAN:）")
 
     # ---- 端口清单 ----
     for name, ports in (("TCP_PORTS", TCP_PORTS), ("UDP_PORTS", UDP_PORTS)):
@@ -1354,48 +1374,25 @@ def _load_searcher(xdb_path, ip_version):
         print(f"[!] py-ip2region 未安装或导入失败: {e}", flush=True)
         return None
 
-    # 版本常量名在不同版本里不同
-    ver_attr = "IPv4" if ip_version == "v4" else "IPv6"
-    ver = getattr(util, ver_attr, None)
-    if ver is None:
-        ver = getattr(util,
-                      "XdbIPv4" if ip_version == "v4" else "XdbIPv6", None)
+    # py-ip2region 3.0.x 的版本标识：util.IPv4 / util.IPv6
+    ver = getattr(util, "IPv4" if ip_version == "v4" else "IPv6", None)
     if ver is None:
         print(f"[!] 无法识别 {ip_version} 版本标识", flush=True)
         return None
 
-    for api_name in ("new_with_file_only", "newWithFileOnly"):
-        fn = getattr(searcher, api_name, None)
-        if fn is None:
-            continue
-        try:
-            return fn(ver, xdb_path)
-        except Exception as e:  # noqa: BLE001 - 兼容不同版本 API，失败后继续尝试下一种
-            print(f"[!] 离线库加载 API {api_name} 失败: {e}", flush=True)
-
-    # 回退：手工加载向量索引再建 searcher
-    # （兼容 snake_case 与 camelCase 两种 API 命名）
-    load_vec = getattr(util, "load_vector_index_from_file", None)
-    if load_vec is None:
-        load_vec = getattr(util, "loadVectorIndexFromFile", None)
-    if load_vec is None:
-        print(f"[!] {xdb_path} 无法通过任何已知 API 加载", flush=True)
-        return None
     try:
-        vec = load_vec(xdb_path)
-        for api_name in ("new_with_vector_index", "newWithVectorIndex"):
-            fn = getattr(searcher, api_name, None)
-            if fn is None:
-                continue
-            try:
-                return fn(ver, xdb_path, vec)
-            except Exception as e:  # noqa: BLE001 - 兼容不同版本 API，失败后统一报错
-                print(f"[!] 离线库向量索引 API {api_name} 失败: {e}",
-                      flush=True)
-    except Exception as e:  # noqa: BLE001 - 回退路径整体失败，最终会打印统一错误
+        return searcher.new_with_file_only(ver, xdb_path)
+    except Exception as e:  # noqa: BLE001 - 第三方库加载失败统一降级
+        print(f"[!] 离线库加载失败: {e}", flush=True)
+
+    # 回退：手工加载向量索引再建 searcher（3.0.x 的 snake_case API）
+    try:
+        vec = util.load_vector_index_from_file(xdb_path)
+        return searcher.new_with_vector_index(ver, xdb_path, vec)
+    except Exception as e:  # noqa: BLE001 - 回退路径失败统一报错
         print(f"[!] 离线库向量索引加载失败: {e}", flush=True)
 
-    print(f"[!] {xdb_path} 无法通过任何已知 API 加载", flush=True)
+    print(f"[!] {xdb_path} 无法通过已知 API 加载", flush=True)
     return None
 
 
@@ -1487,7 +1484,12 @@ def _cleanup_db():
 
 
 def _maybe_cleanup_db():
-    """按 DB_CLEANUP_INTERVAL 节流调用 _cleanup_db()。"""
+    """按 DB_CLEANUP_INTERVAL 节流，并把清理交给写库线程执行。
+
+    ★ 不在日志消费线程上直接 DELETE/VACUUM：大库清理（尤其
+      DB_VACUUM_AFTER_CLEANUP=True 时重写全库）会阻塞日志读取，
+      直接抬高封禁延迟。
+    """
     global _last_cleanup_ts
 
     if DB_RETENTION_DAYS <= 0:
@@ -1497,7 +1499,11 @@ def _maybe_cleanup_db():
     if now - _last_cleanup_ts < DB_CLEANUP_INTERVAL:
         return
     _last_cleanup_ts = now
-    _cleanup_db()
+    if _record_worker is None:
+        # 写库线程尚未启动或已退出：只能同步执行
+        _cleanup_db()
+    else:
+        _cleanup_due.set()
 
 
 # ---------------- 归属地查询 ----------------
@@ -1798,6 +1804,15 @@ def _write_record(job, allow_online=True):
 
 def _record_worker_loop():
     while True:
+        # 清理由 _maybe_cleanup_db() 预约，放在写库线程执行，避免阻塞
+        # 日志消费线程（大库 DELETE/VACUUM 可能持续数秒）。
+        if _cleanup_due.is_set():
+            _cleanup_due.clear()
+            try:
+                _cleanup_db()
+            except Exception as e:  # noqa: BLE001 - 清理失败不能终止写库线程
+                print(f"[!] 数据库清理异常: {e}", flush=True)
+
         try:
             job = _record_queue.get(timeout=0.5)
         except queue.Empty:
